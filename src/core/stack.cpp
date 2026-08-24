@@ -587,7 +587,17 @@ namespace xtcp {
                     if (has_qdisc) {
                         SendOne(conn_id, conn, eth_type, std::move(buf));
                     } else {
+                        // Index invariant (induction over segs): entering
+                        // every iteration 0 <= batch_count < kTxBatchMax -
+                        // it starts at 0 and each iteration ends either
+                        // below the cap or reset to 0 by FlushBatch. MSVC
+                        // /analyze cannot track the counter through the
+                        // FlushBatch lambda and flags batch[batch_count]
+                        // as C6385; suppress that false positive here.
+#pragma warning(push)
+#pragma warning(disable : 6385)
                         ndi::Packet& out = batch[batch_count];
+#pragma warning(pop)
                         out.data = buf.Data();
                         out.len = buf.Len();
                         out.eth_type = eth_type;
