@@ -1029,6 +1029,7 @@ namespace xtcp {
             std::unique_ptr<cc::XtcpCongestionOps> cc_ops_owner_;  /**< Connection-owned hook-table copy (registry race-free) */
             const cc::XtcpCongestionOps* cc_ops_ = NULLPTR;  /**< Plugged algorithm (NULLPTR = Reno); points at cc_ops_owner_ */
             bool        fast_recovery_ = false;  /**< RFC 5681 fast recovery active */
+            bool        ack_not_dup_ = false;    /**< Current ACK carries data/SYN/FIN: not a dupack (RFC 5681 s2) */
             UInt32      recover_fs_ = 0;   /**< RFC 6937 PRR: flight size at the recovery entry */
             UInt32      prr_delivered_ = 0; /**< RFC 6937 PRR: bytes delivered during recovery */
             UInt32      prr_out_ = 0;       /**< RFC 6937 PRR: bytes sent during recovery */

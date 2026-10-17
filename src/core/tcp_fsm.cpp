@@ -2740,8 +2740,12 @@ namespace xtcp {
                 if (0 < pending_send_.size()) {
                     FlushPendingSend(now);
                 }
-                // Duplicate ACK on the frontier.
-                ++dup_acks_;
+                // Duplicate ACK on the frontier. Data-bearing segments
+                // (ack_not_dup_) keep the ACK processing below but
+                // are not counted toward the dupthresh.
+                if (!ack_not_dup_) {
+                    ++dup_acks_;
+                }
                 // RFC 8985 RACK: the time-based verdict can fire BEFORE the
                 // 3-dup threshold - once the reorder window has elapsed, a
                 // gap behind the RACK anchor is loss, not order. Runs on
@@ -2866,8 +2870,12 @@ namespace xtcp {
                         // a retransmit storm: the peer (which already has the
                         // data) answers each duplicate with another dupack
                         // (observed: 55k retransmits for a 1MB echo against
-                        // a real kernel, rto_retx=0).
-                        cc_.snd_cwnd += 1;
+                        // a real kernel, rto_retx=0). Only true duplicate
+                        // ACKs inflate (Linux gates tcp_add_reno_sack on
+                        // !FLAG_NOT_DUP).
+                        if (!ack_not_dup_) {
+                            cc_.snd_cwnd += 1;
+                        }
                     } else {
                         // SACK blocks during a no-SACK entry = the loss is
                         // confirmed after all: no undo.
@@ -4442,7 +4450,18 @@ namespace xtcp {
                             timers_dirty_.store(true, std::memory_order_relaxed);
                         }
                     }
+                    // RFC 5681 s2 / Linux FLAG_DATA: a segment that carries
+                    // data or SYN/FIN is not a duplicate ACK even when
+                    // ack == snd_una_. On a bidirectional flow the peer's data
+                    // burst repeats the same cumulative ACK on every segment;
+                    // counting those as dupacks triggers spurious fast
+                    // retransmits and collapses cwnd. A window change alone is
+                    // deliberately NOT excluded: xtcp's own receiver shrinks
+                    // the advertised window per buffered out-of-order segment,
+                    // so its genuine dupacks carry differing windows.
+                    ack_not_dup_ = 0 < payload_len || hdr.IsFin() || hdr.IsSyn();
                     OnAckReceived(hdr.ack, hdr.IsEce(), now, &opts);  // shared parse from the OnSegment prologue (SACK blocks drive recovery)
+                    ack_not_dup_ = false;
                 }
                 if (payload_len > 0 || hdr.IsFin()) {
                     if (hdr.seq == rcv_nxt_) {
