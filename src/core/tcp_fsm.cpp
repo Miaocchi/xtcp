@@ -26,6 +26,7 @@
 #include <new>
 
 #include <algorithm>
+#include <iterator>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -1661,6 +1662,56 @@ namespace xtcp {
             return 0 == diff;
         }
 
+        bool TcpConn::TrimOooToFrontier() noexcept {
+            bool changed = false;
+            const auto trim = [&](std::map<UInt32, OutSeg>::iterator current) noexcept {
+                const UInt32 skipped = rcv_nxt_ - current->first;
+                const UInt32 length = static_cast<UInt32>(current->second.data.size());
+                changed = true;
+                if (skipped > length || (skipped == length && !current->second.fin)) {
+                    ooo_bytes_ -= length;
+                    ooo_.erase(current);
+                    return;
+                }
+                // Keep only fresh bytes, including a FIN exactly at RCV.NXT.
+                // Re-key the existing node without allocating another node.
+                auto node = ooo_.extract(current);
+                auto& segment = node.mapped();
+                segment.data.erase(segment.data.begin(), segment.data.begin() + skipped);
+                ooo_bytes_ -= skipped;
+                node.key() = rcv_nxt_;
+                auto existing = ooo_.find(rcv_nxt_);
+                if (existing == ooo_.end()) {
+                    ooo_.insert(std::move(node));
+                } else if (segment.data.size() > existing->second.data.size()) {
+                    ooo_bytes_ -= static_cast<UInt32>(existing->second.data.size());
+                    existing->second = std::move(segment);
+                } else {
+                    if (segment.data.size() == existing->second.data.size()) {
+                        existing->second.fin |= segment.fin;
+                    }
+                    ooo_bytes_ -= static_cast<UInt32>(segment.data.size());
+                }
+            };
+            // TCP-old keys occupy at most two numeric map ranges around
+            // wraparound. Visit only those ranges, never scan future entries
+            // on every drain. Each old node is removed/re-keyed once, giving
+            // O(N log N) map work over a drain (plus prefix compaction bytes).
+            for (;;) {
+                const auto boundary = ooo_.lower_bound(rcv_nxt_);
+                if (boundary == ooo_.begin()) break;
+                const auto previous = std::prev(boundary);
+                if (!SeqLt(previous->first, rcv_nxt_)) break;
+                trim(previous);
+            }
+            while (!ooo_.empty()) {
+                const auto last = std::prev(ooo_.end());
+                if (!SeqLt(last->first, rcv_nxt_)) break;
+                trim(last);
+            }
+            return changed;
+        }
+
         bool TcpConn::ProcessClosingData(const Byte* payload, UInt32 payload_len, UInt32 seq,
                                          bool has_fin, TimePoint now, UInt32 ts_val) noexcept {
             // RFC 793 half-close: the peer may still send data after our FIN
@@ -1729,6 +1780,7 @@ namespace xtcp {
                 }
                 rcv_blocked_ = false;  // accepted: the receive window is open
                 while (!ooo_.empty()) {
+                    TrimOooToFrontier();
                     auto it = ooo_.find(rcv_nxt_);
                     if (it == ooo_.end()) {
                         break;
@@ -1802,6 +1854,7 @@ namespace xtcp {
                         // Fresh suffix delivered (or backpressure-free):
                         // the frontier already advanced past the segment's data.
                         while (!ooo_.empty()) {
+                            TrimOooToFrontier();
                             auto it = ooo_.find(rcv_nxt_);
                             if (it == ooo_.end()) {
                                 break;
@@ -2687,8 +2740,12 @@ namespace xtcp {
                 if (0 < pending_send_.size()) {
                     FlushPendingSend(now);
                 }
-                // Duplicate ACK on the frontier.
-                ++dup_acks_;
+                // Duplicate ACK on the frontier. Data-bearing segments
+                // (ack_not_dup_) keep the ACK processing below but
+                // are not counted toward the dupthresh.
+                if (!ack_not_dup_) {
+                    ++dup_acks_;
+                }
                 // RFC 8985 RACK: the time-based verdict can fire BEFORE the
                 // 3-dup threshold - once the reorder window has elapsed, a
                 // gap behind the RACK anchor is loss, not order. Runs on
@@ -2813,8 +2870,12 @@ namespace xtcp {
                         // a retransmit storm: the peer (which already has the
                         // data) answers each duplicate with another dupack
                         // (observed: 55k retransmits for a 1MB echo against
-                        // a real kernel, rto_retx=0).
-                        cc_.snd_cwnd += 1;
+                        // a real kernel, rto_retx=0). Only true duplicate
+                        // ACKs inflate (Linux gates tcp_add_reno_sack on
+                        // !FLAG_NOT_DUP).
+                        if (!ack_not_dup_) {
+                            cc_.snd_cwnd += 1;
+                        }
                     } else {
                         // SACK blocks during a no-SACK entry = the loss is
                         // confirmed after all: no undo.
@@ -3486,9 +3547,15 @@ namespace xtcp {
                 // forever (Linux tcp_push only Nagles fresh sends, never the
                 // ACK-clock refill).
                 const UInt32 seq = snd_nxt_;
+                // Preserve PUSH at the end of this buffered byte range, not
+                // on every MSS-sized segment. Besides matching TCP push
+                // semantics, this keeps adjacent data segments eligible for
+                // downstream VNET GSO coalescing.
+                const UInt16 data_flags = kFlagAck |
+                    ((off + n == data.size()) ? kFlagPsh : 0) |
+                    (cwr_pending_ ? kFlagCwr : 0);
                 buf::BufRef packet = BuildSegmentPacket(local_, remote_, seq, rcv_nxt_,
-                                                        kFlagAck | kFlagPsh |
-                                                            (cwr_pending_ ? kFlagCwr : 0), data.data() + off, n,
+                                                        data_flags, data.data() + off, n,
                                                         AdvertisedWindow(), rcv_wscale_,
                                                         Md5Key(), Md5KeyLen(), NULLPTR, 0, NULLPTR, ecn_active_);
                 if (packet.IsEmpty()) {
@@ -4383,7 +4450,18 @@ namespace xtcp {
                             timers_dirty_.store(true, std::memory_order_relaxed);
                         }
                     }
+                    // RFC 5681 s2 / Linux FLAG_DATA: a segment that carries
+                    // data or SYN/FIN is not a duplicate ACK even when
+                    // ack == snd_una_. On a bidirectional flow the peer's data
+                    // burst repeats the same cumulative ACK on every segment;
+                    // counting those as dupacks triggers spurious fast
+                    // retransmits and collapses cwnd. A window change alone is
+                    // deliberately NOT excluded: xtcp's own receiver shrinks
+                    // the advertised window per buffered out-of-order segment,
+                    // so its genuine dupacks carry differing windows.
+                    ack_not_dup_ = 0 < payload_len || hdr.IsFin() || hdr.IsSyn();
                     OnAckReceived(hdr.ack, hdr.IsEce(), now, &opts);  // shared parse from the OnSegment prologue (SACK blocks drive recovery)
+                    ack_not_dup_ = false;
                 }
                 if (payload_len > 0 || hdr.IsFin()) {
                     if (hdr.seq == rcv_nxt_) {
@@ -4436,6 +4514,7 @@ namespace xtcp {
                             break;
                         }
                         while (!ooo_.empty()) {
+                            TrimOooToFrontier();
                             // Exact-key lookup: sequence wraparound makes
                             // std::less<UInt32> ordering meaningless at the
                             // 2^32 boundary, so do not rely on map order.
@@ -4453,7 +4532,7 @@ namespace xtcp {
                                 ts_recent_ = seg.ts_val;
                                 ts_recent_stamp_ = static_cast<UInt32>((now / 1000) & 0xFFFFFFFF);
                             }
-                            if (recv_cb_ && !recv_cb_(seg.data.data(), static_cast<UInt32>(seg.data.size()))) {
+                            if (!seg.data.empty() && recv_cb_ && !recv_cb_(seg.data.data(), static_cast<UInt32>(seg.data.size()))) {
                                 // Backpressure: drop this buffered segment
                                 // (refund its bytes) and stop draining; the
                                 // peer retransmits, keeping the data intact
@@ -4556,6 +4635,7 @@ namespace xtcp {
                                     break;
                                 }
                                 while (!ooo_.empty()) {
+                                    TrimOooToFrontier();
                                     // Exact-key lookup: sequence wraparound makes
                                     // std::less<UInt32> ordering meaningless at
                                     // the 2^32 boundary, so do not rely on map order.
@@ -4566,7 +4646,7 @@ namespace xtcp {
                                     const OutSeg& os = it->second;
                                     const UInt32 prev_os = rcv_nxt_;
                                     rcv_nxt_ += static_cast<UInt32>(os.data.size());  // advance before callback
-                                    if (recv_cb_ && !recv_cb_(os.data.data(), static_cast<UInt32>(os.data.size()))) {
+                                    if (!os.data.empty() && recv_cb_ && !recv_cb_(os.data.data(), static_cast<UInt32>(os.data.size()))) {
                                         // Backpressure: drop and stop draining.
                                         rcv_nxt_ = prev_os;  // rollback
                                         rcv_blocked_ = true;  // advertise window 0 (RFC 1122 s4.2.3.4)
@@ -5013,6 +5093,5 @@ namespace xtcp {
         }
     }
 }
-
 
 

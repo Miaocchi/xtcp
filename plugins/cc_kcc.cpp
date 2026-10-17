@@ -101,6 +101,9 @@ namespace {
         UInt64  total_delivered = 0;
         UInt64  prev_delivered = 0;
         UInt64  next_rtt_delivered = 0;
+        UInt64  next_rtt_stamp_us = 0;
+        UInt64  round_sample_delivered = 0;
+        UInt64  round_sample_interval_us = 0;
         UInt64  congestion_window_bytes = 10 * 1460;
 
         UInt64 BwMax() const noexcept {
@@ -127,6 +130,15 @@ namespace {
         }
         void BwUpdate(UInt64 bw, UInt32 cnt_rtt) noexcept {
             if (0 == bw) {
+                return;
+            }
+            // Rate samples can arrive several times within one delivery
+            // round. Keep the best sample for that round instead of letting
+            // each ACK overwrite one of the ten RTT-window entries.
+            if (0 < bw_sample_count && bw_samples[bw_sample_cur].rtt_cnt == cnt_rtt) {
+                if (bw > bw_samples[bw_sample_cur].val) {
+                    bw_samples[bw_sample_cur].val = bw;
+                }
                 return;
             }
             if (0 == bw_sample_count) {
@@ -342,14 +354,26 @@ namespace {
 
         // Model update.
         const UInt64 interval_us = (now_us > k->prev_ack_us) ? (now_us - k->prev_ack_us) : 0;
-        if (k->prev_delivered >= k->next_rtt_delivered) {
-            // Reference kcc_update_model: the next round starts at the current total.
-            k->next_rtt_delivered = k->total_delivered;
+        const UInt32 round_rtt_us = (0 < rtt_us) ? rtt_us : 1;
+        const bool round_completed = 0 == k->next_rtt_stamp_us || now_us >= k->next_rtt_stamp_us;
+        bool completed_sample_round = false;
+        if (round_completed) {
+            if (0 < k->round_sample_delivered && 0 < k->round_sample_interval_us) {
+                completed_sample_round = true;
+            }
+            k->round_sample_delivered = 0;
+            k->round_sample_interval_us = 0;
+            const UInt64 round_us = (0 < round_rtt_us) ? round_rtt_us : 1;
+            k->next_rtt_stamp_us = now_us + round_us;
             ++k->rtt_cnt;
         }
         UInt64 bw = 0;
         if (0 < delivered && 0 < interval_us) {
             bw = (delivered << 24) / interval_us;
+        }
+        if (0 < delivered && 0 < interval_us) {
+            k->round_sample_delivered += delivered;
+            k->round_sample_interval_us += interval_us;
         }
         k->BwUpdate(bw, k->rtt_cnt);
         k->max_bw = k->BwMax();
@@ -376,7 +400,7 @@ namespace {
         }
 
         // Full-bw detection and FSM transitions.
-        if (0 == k->full_bw_reached) {
+        if (completed_sample_round && 0 == k->full_bw_reached) {
             const UInt64 bw_now = k->BwMax();
             // "3.2% step" (kFullBwThresh = 320 = 3.2%): a plateau round
             // grows by less than 3.2% vs the running max. Count CONSECUTIVE
@@ -409,7 +433,8 @@ namespace {
         }
 
         // Control outputs.
-        const UInt64 pacing_bw = (0 != k->max_bw) ? k->max_bw : kBwUnit;
+        const UInt64 pacing_bw = (0 != k->max_bw) ? k->max_bw
+            : ((0 != bw) ? bw : kBwUnit);
         UInt64 rate = (pacing_bw * k->pacing_gain) >> 8;
         rate = (rate * 990000ull) >> 24;
         if (0 == k->has_seen_rtt && k->min_rtt_us != kMinRttUninit && 0 < k->min_rtt_us && 0 < sk->mss) {

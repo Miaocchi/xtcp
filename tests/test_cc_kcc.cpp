@@ -73,6 +73,7 @@ static void TestKccDifferential() {
         rs.rtt_us = rtt_us;
         rs.acked = acked;
         rs.lost = lost;
+        sk.inflight = flight;
         ops->cong_control(&sk, &rs);
 
         // Compare geodesic estimator outputs (exact).
@@ -96,6 +97,106 @@ static void TestKccDifferential() {
             }
         }
     }
+    ops->release(&sk);
+}
+
+static void TestKccRoundBoundaryTracksFlight() {
+    xtcp::cc::RegisterKcc();
+    const xtcp::cc::XtcpCongestionOps* ops = xtcp::cc::FindCongestionControl("kcc");
+    CHECK(NULLPTR != ops);
+
+    kcc_core ref;
+    kcc_core_init(&ref);
+    ref.mss = 1460;
+    ref.last_ack_us = 1000000;
+
+    xtcp::cc::XtcpConnCc sk;
+    ops->init(&sk);
+    sk.mss = 1460;
+    constexpr UInt32 kDelivered = 1460;
+    constexpr UInt32 kFirstDelivered = 10 * kDelivered;
+    constexpr UInt32 kFlight = 20 * 1460;
+    constexpr UInt32 kInterval = 100;
+    UInt64 now_us = 1000000;
+
+    // Ten ACK samples occur within the 1ms RTT. Keep the best bandwidth
+    // sample in the round, but advance full-bandwidth detection per round.
+    for (UInt32 i = 0; i < 10; ++i) {
+        const UInt32 delivered = (0 == i) ? kFirstDelivered : kDelivered;
+        now_us += kInterval;
+        kcc_core_on_ack(&ref, static_cast<s64>(now_us), delivered, 1000,
+                        kFlight, 0);
+        sk.inflight = kFlight;
+        xtcp::cc::RateSample rs;
+        rs.delivered = delivered;
+        rs.interval_us = kInterval;
+        rs.rtt_us = 1000;
+        rs.acked = kDelivered;
+        ops->cong_control(&sk, &rs);
+        CHECK(1 == ref.rtt_cnt);
+        CHECK((static_cast<s64>(kFirstDelivered) << 24) / kInterval == ref.max_bw);
+        CHECK(0 == ref.full_bw_cnt);
+        CHECK(static_cast<UInt32>(kcc_core_cwnd_segs(&ref)) == sk.snd_cwnd);
+    }
+
+    now_us += kInterval;
+    kcc_core_on_ack(&ref, static_cast<s64>(now_us), kDelivered, 1000,
+                    kFlight, 0);
+    xtcp::cc::RateSample rs;
+    rs.delivered = kDelivered;
+    rs.interval_us = kInterval;
+    rs.rtt_us = 1000;
+    rs.acked = kDelivered;
+    ops->cong_control(&sk, &rs);
+    CHECK(2 == ref.rtt_cnt);
+    CHECK((static_cast<s64>(kFirstDelivered) << 24) / kInterval == ref.max_bw);
+    CHECK(0 == ref.full_bw_cnt);
+    CHECK(static_cast<UInt32>(kcc_core_cwnd_segs(&ref)) == sk.snd_cwnd);
+    ops->release(&sk);
+}
+
+static void TestKccRoundBoundaryTracksCurrentRtt() {
+    xtcp::cc::RegisterKcc();
+    const xtcp::cc::XtcpCongestionOps* ops = xtcp::cc::FindCongestionControl("kcc");
+    CHECK(NULLPTR != ops);
+
+    kcc_core ref;
+    kcc_core_init(&ref);
+    ref.mss = 1460;
+    ref.last_ack_us = 1000000;
+
+    xtcp::cc::XtcpConnCc sk;
+    ops->init(&sk);
+    sk.mss = 1460;
+    constexpr UInt32 kFlight = 20 * 1460;
+    constexpr UInt32 kFastDelivered = 10 * 1460;
+    UInt64 now_us = 1000000;
+    const auto sample = [&](UInt32 delivered, UInt32 interval_us, UInt32 rtt_us) {
+        now_us += interval_us;
+        kcc_core_on_ack(&ref, static_cast<s64>(now_us), delivered, rtt_us,
+                        kFlight, 0);
+        sk.inflight = kFlight;
+        xtcp::cc::RateSample rs;
+        rs.delivered = delivered;
+        rs.interval_us = interval_us;
+        rs.rtt_us = rtt_us;
+        rs.acked = delivered;
+        ops->cong_control(&sk, &rs);
+        CHECK(static_cast<UInt32>(kcc_core_cwnd_segs(&ref)) == sk.snd_cwnd);
+    };
+
+    // Establish a 1ms min RTT and a high rate sample, then model a queued
+    // 4ms RTT with ACK rate samples every 400us. The ten-round bandwidth
+    // window must age in current RTTs, not ten times faster at min RTT.
+    sample(kFastDelivered, 100, 1000);
+    CHECK(1 == ref.rtt_cnt);
+    const s64 max_bw = (static_cast<s64>(kFastDelivered) << 24) / 100;
+    CHECK(max_bw == ref.max_bw);
+    for (UInt32 i = 0; i < 20; ++i) {
+        sample(1460, 400, 4000);
+        CHECK(max_bw == ref.max_bw);
+    }
+    CHECK(3 == ref.rtt_cnt);
     ops->release(&sk);
 }
 
@@ -149,17 +250,14 @@ static void TestKccFullBwTransition() {
         ops->cong_control(&sk, &rs);
         rates[i] = sk.pacing_rate;
     }
-    // Samples 1-3: STARTUP (monotone-max pacing).
-    for (UInt32 i = 0; i < 3; ++i) {
+    // One sample seeds the model; a completed round establishes full_bw,
+    // then three plateau rounds accrue before STARTUP exits.
+    for (UInt32 i = 0; i < 5; ++i) {
         CHECK(kStartupRate == rates[i]);
     }
-    // Sample 4: full_bw reached (3 plateau rounds) - the gains were already
-    // computed in STARTUP, so the rate is still the STARTUP value, but the
-    // full_bw_reached direct assignment replaces the monotone max.
-    CHECK(kStartupRate == rates[3]);
-    // Samples 5-8: PROBE_BW (gain 5/4). Pre-fix this stayed at the STARTUP
+    // Samples 6-8: PROBE_BW (gain 5/4). Pre-fix this stayed at the STARTUP
     // monotone max forever - the assertion pins the DRAIN/PROBE_BW FSM.
-    for (UInt32 i = 4; i < 8; ++i) {
+    for (UInt32 i = 5; i < 8; ++i) {
         std::fprintf(stderr, "[kcc-fbw] sample %u rate=%llu (expect %llu probe)\n",
                      i + 1, (unsigned long long)rates[i], (unsigned long long)kProbeRate);
         CHECK(kProbeRate == rates[i]);
@@ -170,6 +268,8 @@ static void TestKccFullBwTransition() {
 int main() {
     TestKccRegistry();
     TestKccDifferential();
+    TestKccRoundBoundaryTracksFlight();
+    TestKccRoundBoundaryTracksCurrentRtt();
     TestKccFullBwTransition();
     if (0 < g_failures) {
         std::fprintf(stderr, "test_cc_kcc: %d failure(s)\n", g_failures);

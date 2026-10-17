@@ -15,6 +15,7 @@
  *   4. Every async completion fires exactly once (1:1).
  */
 
+#include <thread>
 #include <xtcp/async/async.h>
 #include <xtcp/qdisc/qdisc.h>
 #include <xtcp/ndi/manual.h>
@@ -361,14 +362,16 @@ int main() {
         CHECK(kTotal == a_sent[f]);
     }
 
-    // Drain any remaining qdisc backlog.
-    guard = 0;
-    while (qdisc->ops->has_backlog(qdisc) && 200000 > ++guard) {
+    // Drain any remaining qdisc backlog. The tail of the rate-limited flow
+    // is released on the pacing clock, so bound the drain by elapsed time
+    // rather than by loop iterations (iteration speed varies per host).
+    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (qdisc->ops->has_backlog(qdisc) && std::chrono::steady_clock::now() < drain_deadline) {
         Pump(backend_b, backend_a);
         Pump(backend_a, backend_b);
         stack_b.Stack().PollAckTimers();
+        std::this_thread::yield();
     }
-    CHECK(200000 > guard);
     CHECK(!qdisc->ops->has_backlog(qdisc));
 
     // Final integrity: A received B's pattern (0x40+f, B -> A through the
