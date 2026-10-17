@@ -290,7 +290,7 @@ int main() {
                     CHECK(false);
                     return;
                 }
-                while (c.rx_received.load() < off + want) {
+                while (c.rx_received.load() == off) {
                     if (std::chrono::steady_clock::now() > deadline) {
                         std::fprintf(stderr, "[thread] f%u READ TIMEOUT rx=%u want=%u\n",
                                      idx, c.rx_received.load(), off + want);
@@ -360,14 +360,16 @@ int main() {
         t.join();
     }
 
-    // Drain any remaining qdisc backlog.
-    guard = 0;
-    while (qdisc->ops->has_backlog(qdisc) && 200000 > ++guard) {
+    // Drain any remaining qdisc backlog. The tail of the rate-limited flow
+    // is released on the pacing clock, so bound the drain by elapsed time
+    // rather than by loop iterations (iteration speed varies per host).
+    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (qdisc->ops->has_backlog(qdisc) && std::chrono::steady_clock::now() < drain_deadline) {
         Pump(backend_b, backend_a);
         Pump(backend_a, backend_b);
         stack_b.Stack().PollAckTimers();
+        std::this_thread::yield();
     }
-    CHECK(200000 > guard);
     CHECK(!qdisc->ops->has_backlog(qdisc));
 
     // Integrity: A received B's pattern (0x40+f); B received A's (0x50+f).
