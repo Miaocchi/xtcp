@@ -118,9 +118,12 @@ struct kcc_core {
 	u32  has_seen_rtt;
 	u32  prev_ack_us;
 	u32  last_ack_us;
+	u64  round_sample_delivered;
+	u64  round_sample_interval_us;
 	s64  total_delivered;
 	s64  prev_delivered;
 	s64  next_rtt_delivered;
+	s64  next_rtt_stamp_us;
 
 	/* Inputs */
 	u32  mss;
@@ -137,6 +140,15 @@ static u32 kcc_max_u32(u32 a, u32 b) { return a > b ? a : b; }
 
 static void kcc_bw_update(struct kcc_core *k, s64 bw, u32 rtt_cnt) {
 	if (bw <= 0) return;
+	/* Rate samples can arrive several times within one delivery round.
+	 * Keep the best sample for that round rather than letting each ACK
+	 * overwrite one of the ten RTT-window entries. */
+	if (k->bw_sample_count > 0 &&
+	    k->bw_samples[k->bw_sample_cur].rtt_cnt == rtt_cnt) {
+		if (bw > k->bw_samples[k->bw_sample_cur].val)
+			k->bw_samples[k->bw_sample_cur].val = bw;
+		return;
+	}
 	if (k->bw_sample_count == 0) {
 		k->bw_sample_count = 1;
 		k->bw_sample_cur = 0;
@@ -315,16 +327,27 @@ static void kcc_update_model(struct kcc_core *k, s64 now_us, s64 delivered, s64 
 	s64 interval_us = now_us - (s64)k->prev_ack_us;
 	if (interval_us < 0) interval_us = 0;
 
-	/* Round boundary */
+	/* A RateSample can be emitted more often than once per RTT. */
 	u32 prev_rtt_cnt = k->rtt_cnt;
-	if (!(k->prev_delivered < k->next_rtt_delivered)) {
-		k->next_rtt_delivered = k->total_delivered;
+	const s64 round_rtt_us = (rtt_us > 0) ? rtt_us : 1;
+	int round_completed = k->next_rtt_stamp_us == 0 || now_us >= k->next_rtt_stamp_us;
+	int completed_sample_round = 0;
+	if (round_completed) {
+		if (k->round_sample_delivered > 0 && k->round_sample_interval_us > 0) {
+			completed_sample_round = 1;
+		}
+		k->round_sample_delivered = 0;
+		k->round_sample_interval_us = 0;
+		const s64 round_us = (round_rtt_us > 0) ? round_rtt_us : 1;
+		k->next_rtt_stamp_us = now_us + round_us;
 		k->rtt_cnt++;
 	}
 
 	s64 bw = 0;
 	if (delivered > 0 && interval_us > 0) {
 		bw = (delivered << BW_SCALE) / interval_us;
+		k->round_sample_delivered += delivered;
+		k->round_sample_interval_us += interval_us;
 	}
 	(void)prev_rtt_cnt;
 	kcc_bw_update(k, bw, k->rtt_cnt);
@@ -350,7 +373,7 @@ static void kcc_update_model(struct kcc_core *k, s64 now_us, s64 delivered, s64 
 		break;
 	}
 
-	kcc_check_full_bw_reached(k);
+	if (completed_sample_round) kcc_check_full_bw_reached(k);
 	if (k->mode == KCC_MODE_STARTUP && k->full_bw_reached) {
 		k->mode = KCC_MODE_DRAIN;
 	}
@@ -422,6 +445,10 @@ void kcc_core_init(struct kcc_core *k) {
 void kcc_core_on_ack(struct kcc_core *k, s64 now_us, s64 delivered_bytes, s64 rtt_us, s64 flight_bytes, s64 losses) {
 	k->flight_bytes = (u32)flight_bytes;
 	s64 acked = delivered_bytes > 0 ? delivered_bytes : 0;
+	s64 sample_interval = now_us - (s64)k->last_ack_us;
+	if (sample_interval < 0) sample_interval = 0;
+	s64 provisional_bw = (delivered_bytes > 0 && sample_interval > 0)
+		? (delivered_bytes << BW_SCALE) / sample_interval : 0;
 	k->prev_delivered = k->total_delivered;
 	k->total_delivered += acked;
 	k->prev_ack_us = k->last_ack_us;
@@ -429,9 +456,9 @@ void kcc_core_on_ack(struct kcc_core *k, s64 now_us, s64 delivered_bytes, s64 rt
 
 	kcc_update_model(k, now_us, delivered_bytes, rtt_us, acked, flight_bytes);
 
-	s64 pacing_bw = k->max_bw;
+	s64 pacing_bw = k->max_bw > 0 ? k->max_bw : provisional_bw;
 	kcc_set_pacing_rate(k, pacing_bw, (s32)k->pacing_gain);
-	kcc_set_cwnd(k, pacing_bw, (s32)k->cwnd_gain, acked, flight_bytes, losses);
+	kcc_set_cwnd(k, k->max_bw, (s32)k->cwnd_gain, acked, flight_bytes, losses);
 }
 
 u64  kcc_core_x_est(const struct kcc_core *k) { return k->x_est; }
