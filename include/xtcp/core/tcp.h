@@ -983,6 +983,7 @@ namespace xtcp {
                 bool fin = false;  // RFC 793: the segment carried the FIN flag
                 UInt32 ts_val = 0; // RFC 7323: the segment's TSval (TsRecent on drain)
             };
+            bool TrimOooToFrontier() noexcept;
             std::map<UInt32, OutSeg> ooo_;       /**< Out-of-order reassembly buffer (seq -> segment) */
             UInt32      ooo_bytes_ = 0;
             std::deque<SentSeg> retrans_queue_;
@@ -1120,7 +1121,6 @@ namespace xtcp {
     }
 }
 #include <chrono>
-
 
 
 
