@@ -129,6 +129,7 @@ if(XTCP_BUILD_TESTS)
         test_tlp
         test_rack
         test_dsack
+        test_sack_option_budget
         test_ip
         test_pmtud
         test_mtu_probe
