@@ -377,13 +377,20 @@ namespace xtcp {
                 Byte sack_n = 0;
                 UInt32 sack_opt_len = 0;
                 if (!include_sack && NULLPTR != sack_blocks && 0 < sack_blocks_count) {
-                    // RFC 2385 MD5 shares the 60-byte TCP option budget with
-                    // RFC 2018 SACK. MD5 costs 20 bytes, so cap SACK at 2
-                    // blocks (2 + 16 + 2 NOP = 20 bytes): 20 + 20 + 20 = 60.
-                    // Without MD5, 4 blocks (2 + 32 + 2 NOP = 36) fit: 56.
-                    const Byte sack_cap = include_md5 ? 2 : 4;
+                    // RFC 2018 SACK shares the 40-byte TCP option space with
+                    // every other option on the segment: the 12-byte TSopt
+                    // (RFC 7323) and the 20-byte MD5 signature (RFC 2385).
+                    // Fit as many blocks as the remaining space allows -
+                    // 4 alone (2 + 32 + 2 NOP = 36), 3 with timestamps
+                    // (12 + 2 + 24 + 2 NOP = 40, as Linux), 2 with MD5
+                    // (20 + 2 + 16 + 2 NOP = 40). Overflowing 40 bytes makes
+                    // the 4-bit data offset wrap: the peer drops the ACK.
+                    const UInt32 used = syn_opt_len + (include_md5 ? 20 : 0);
+                    const UInt32 room = (used < 40) ? 40 - used : 0;
+                    const UInt32 fit = (room >= 2 + 8) ? (room - 2) / 8 : 0;
+                    const Byte sack_cap = static_cast<Byte>(fit < 4 ? fit : 4);
                     sack_n = (sack_blocks_count > sack_cap) ? sack_cap : sack_blocks_count;
-                    sack_opt_len = ((2 + 8 * sack_n) + 3) & ~3u;  // NOP-padded to 4
+                    sack_opt_len = (0 < sack_n) ? (((2 + 8 * sack_n) + 3) & ~3u) : 0;  // NOP-padded to 4
                 }
                 const UInt32 md5_off = syn_opt_len + sack_opt_len;
                 const UInt32 opt_len = md5_off + (include_md5 ? 20 : 0);
