@@ -1756,6 +1756,9 @@ namespace xtcp {
             }
             CutCwnd();
             SetCaState(4);   // kernel tcp_enter_loss: tcp_set_ca_state(CA_Loss)
+            // Kernel tcp_enter_loss: tp->high_seq = tp->snd_nxt (the recovery
+            // -end test is snd_una >= high_seq).
+            high_seq_ = snd_nxt_;
             // Kernel tcp_enter_loss ends with
             //   tcp_snd_cwnd_set(tp, tcp_packets_in_flight(tp) + 1)
             // which is exactly what the plugin branch of CutCwnd already
@@ -2507,6 +2510,8 @@ namespace xtcp {
             // must too (the plugin's wmax/epoch/loss state must not drift).
             CutCwnd();
             SetCaState(3);   // kernel CA_Recovery
+            // Kernel tcp_init_cwnd_reduction: tp->high_seq = tp->snd_nxt.
+            high_seq_ = snd_nxt_;
             fast_recovery_ = true;
             // Mirror of the dup-ACK entry: PRR's flight-size anchor plus the
             // retransmission cursor (the earliest missing segment).
@@ -2706,6 +2711,11 @@ namespace xtcp {
                     fast_recovery_ = false;
                     sack_retx_next_ = 0;
                     dup_acks_ = 0;
+                    // Kernel tcp_try_undo_dsack -> tcp_try_keep_open: the
+                    // recovery is undone, so the CA state leaves Recovery.
+                    if (3 == cc_.ca_state) {
+                        SetCaState(0);
+                    }
                     ++dsack_undos_;
                 }
             }
@@ -2781,6 +2791,12 @@ namespace xtcp {
                         cc_.snd_ssthresh = prior_ssthresh_;
                     }
                     rto_pending_ = false;
+                    // Kernel tcp_try_undo_loss: a spurious RTO returns the CA
+                    // state to Open (tcp_set_ca_state(TCP_CA_Open)).
+                    if (4 == cc_.ca_state) {
+                        SetCaState(0);
+                        high_seq_ = 0;
+                    }
                 }
                 // Cumulative ACK advanced: sample RTT from the oldest newly
                 // acknowledged segment, then drop acknowledged segments.
@@ -2960,6 +2976,36 @@ namespace xtcp {
                     acked, popped_count, newest_len, batch_retrans_, prior_sacked_out,
                     ece, (NULLPTR != opts && 0 < opts->sack_count),
                     newest_sent_delivered, cc_.delivered, peer_mss_);
+                // Kernel tcp_fastretrans_alert (state exit, part D): a
+                // recovery/loss episode ends once snd_una reaches high_seq -
+                // the snd_nxt snapshot taken at the entry. The CA state MUST
+                // return to CA_Open BEFORE the CC hook runs: the kernel calls
+                // tcp_fastretrans_alert (state machine) and only afterwards
+                // tcp_rate_gen + tcp_cong_control (the CC hook). Without this
+                // transition a state-keying CC (kcc_set_cwnd_to_recover_or_
+                // restore) sees "Recovery entered" (prev=Open, state=Recovery)
+                // on EVERY later ACK and keeps re-cutting the window to
+                // inflight+acked - the window can never recover.
+                if (0 != high_seq_ && !SeqLt(snd_una_, high_seq_)) {
+                    if (fast_recovery_) {
+                        // Linux tcp_try_undo_recovery: a no-SACK entry whose
+                        // recovery completes cleanly restores the pre-cut
+                        // window; a confirmed-loss entry ends at ssthresh.
+                        if (undo_marker_) {
+                            cc_.snd_cwnd = prior_cwnd_;
+                            cc_.snd_ssthresh = prior_ssthresh_;
+                            undo_marker_ = false;
+                        } else {
+                            cc_.snd_cwnd = cc_.snd_ssthresh;
+                        }
+                        fast_recovery_ = false;
+                        sack_retx_next_ = 0;
+                    }
+                    if (4 == cc_.ca_state || 3 == cc_.ca_state) {
+                        SetCaState(0);   // kernel tcp_set_ca_state(TCP_CA_Open)
+                    }
+                    high_seq_ = 0;
+                }
                 if (0 < pending_send_.size()) {
                     FlushPendingSend(now);  // buffered sends ride the freed window
                 }
@@ -3082,6 +3128,11 @@ namespace xtcp {
                         }
                         fast_recovery_ = false;
                         sack_retx_next_ = 0;
+                        // The recovery ends here: the CA state must follow
+                        // (kernel tcp_try_undo_recovery -> tcp_set_ca_state
+                        // (TCP_CA_Open)); leaving it at Recovery makes a
+                        // state-keying CC re-cut the window on every ACK.
+                        SetCaState(0);
                     } else {
                         // Real gaps remain: the loss signal is confirmed, so a
                         // no-SACK entry may not undo.
@@ -3246,6 +3297,8 @@ namespace xtcp {
                         cc_.snd_cwnd = cc_.snd_ssthresh + 3;
                     }
                     SetCaState(3);   // kernel CA_Recovery
+                    // Kernel tcp_init_cwnd_reduction: tp->high_seq = tp->snd_nxt.
+                    high_seq_ = snd_nxt_;
                     fast_recovery_ = true;
                     fast_retransmit_seq_ = retrans_queue_.front().seq;
                     sack_retx_next_ = snd_una_;

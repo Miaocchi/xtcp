@@ -1190,12 +1190,14 @@ namespace {
     UInt32 g_recCalls = 0;
     UInt32 g_recTxStart = 0;
     UInt32 g_recMarker = 0;
+    Byte g_recCaState = 0;
 
     void RecInit(XtcpConnCc*) noexcept {}
     void RecRelease(XtcpConnCc*) noexcept {}
     void RecControl(XtcpConnCc* sk, const RateSample* rs) noexcept {
         g_recLast = *rs;
         g_recMarker = sk->app_limited;
+        g_recCaState = sk->ca_state;
         ++g_recCalls;
     }
     void RecEvent(XtcpConnCc*, xtcp::cc::CaEvent ev) noexcept {
@@ -1283,9 +1285,11 @@ namespace {
         }
 
         void Send(UInt32 n) {
-            Byte buf[4096];
-            std::memset(buf, 0, sizeof(buf));
-            CHECK(conn.SendData(buf, n, now));
+            // Size the payload buffer to the request: callers pass
+            // multiples of the MSS (e.g. 4 * 1460 = 5840), which a fixed
+            // 4096-byte stack array would overflow (ASan caught it).
+            std::vector<Byte> buf(n, 0);
+            CHECK(conn.SendData(buf.data(), n, now));
         }
 
         void Deliver(UInt32 ack, UInt16 flags = xtcp::core::kFlagAck,
@@ -1488,6 +1492,45 @@ namespace {
         conn.OnRetransmitTimer(now);
         CHECK(0 < conn.Cwnd());
         CHECK(conn.Cwnd() <= 0x7FFFFFFFu);
+    }
+
+    /**
+     * @brief The CA state must return to Open when a recovery episode ends.
+     *
+     * Kernel tcp_fastretrans_alert ends the episode once snd_una reaches
+     * high_seq (tp->snd_nxt at the entry) and calls tcp_set_ca_state(
+     * TCP_CA_Open) BEFORE tcp_cong_control (the CC hook). The port kept
+     * ca_state at Recovery/Loss forever, so a state-keying CC (KCC's
+     * kcc_set_cwnd_to_recover_or_restore) saw "Recovery entered" on every
+     * later ACK and re-cut the window to inflight+acked - the window could
+     * never recover. Red baseline: cwnd stayed 4 and ca_state stayed 3
+     * (observed as test_fastrec_undo "cwnd_before <= cwnd_after" on CI).
+     */
+    void TestKccFsmCaStateReturnsToOpen() {
+        FsmHarness h;
+        h.Send(kMss);
+        h.Send(kMss);
+        h.Send(kMss);
+        h.Send(kMss);
+        const UInt32 una = h.conn.SndUna();
+        const UInt32 end = h.conn.SndNxt();
+        const UInt32 cwnd_before = h.conn.Cwnd();
+        // Three RAW dup-ACKs (no SACK blocks): no-SACK fast-recovery entry.
+        for (UInt32 i = 0; i < 3; ++i) {
+            h.now += 1000;
+            h.Deliver(una, xtcp::core::kFlagAck);
+        }
+        CHECK(h.conn.FastRecovery());          // recovery active
+        // The cumulative ACK covers everything up to high_seq: the episode
+        // ends and the state must be Open when the CC hook runs.
+        g_recCalls = 0;
+        g_recCaState = 0xFF;
+        h.now += 20000;
+        h.Deliver(end);
+        CHECK(1 == g_recCalls);
+        CHECK(0u == g_recCaState);             // red: 3 (Recovery) before the fix
+        CHECK(!h.conn.FastRecovery());
+        CHECK(cwnd_before <= h.conn.Cwnd());   // window not re-cut by the CC
     }
 
     /**
@@ -2026,6 +2069,7 @@ int main() {
     TestKccFsmDelayedFields();
     TestKccFsmTxStartAndAppLimited();
     TestKccFsmCwndStaysLegal();
+    TestKccFsmCaStateReturnsToOpen();
     TestKccPipeExcludesLost();
     TestKccTxStartOnTlp();
     TestKccDsackCountsDelivered();

@@ -1145,6 +1145,7 @@ namespace xtcp {
             UInt32      last_retx_len_ = 0;      /**< Last SACK-path retransmit length (storm gate) */
             UInt32      dsack_retx_seq_ = 0;     /**< RFC 2883: most recent retransmitted range start (persists across ACKs) */
             UInt32      dsack_retx_len_ = 0;     /**< RFC 2883: most recent retransmitted range length (persists across ACKs) */
+            UInt32      high_seq_ = 0;           /**< Kernel tp->high_seq: snd_nxt at the loss/recovery entry (recovery-end test) */
             UInt32      prior_cwnd_ = 0;         /**< Pre-recovery cwnd (spurious fast-recovery undo) */
             UInt32      prior_ssthresh_ = 0;     /**< Pre-recovery ssthresh (spurious fast-recovery undo) */
             bool        undo_marker_ = false;    /**< No-SACK fast-recovery entry: undo candidate */
