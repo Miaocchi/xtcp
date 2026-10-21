@@ -514,7 +514,9 @@ namespace {
                 (abs_innov >> kScaleShift) > 0xFFFFFFFFull ? 0xFFFFFFFFu
                                                            : static_cast<UInt32>(abs_innov >> kScaleShift));
             k->jitter_ewma = (k->sample_cnt > 1)
-                                 ? (k->jitter_ewma * kJitterEwmaNum + raw_jitter) / kJitterEwmaDen
+                                 ? static_cast<UInt32>(
+                                       (static_cast<UInt64>(k->jitter_ewma) * kJitterEwmaNum +
+                                        raw_jitter) / kJitterEwmaDen)
                                  : raw_jitter;
             const UInt32 jitter_cap = (k->min_rtt_us != kMinRttUninit)
                                           ? ((k->min_rtt_us > kRttSampleMaxUs) ? k->min_rtt_us : kRttSampleMaxUs)
@@ -772,6 +774,48 @@ namespace {
         if (NULLPTR == k) {
             return;
         }
+        // Full plugin-epoch reset. Priv() REUSES an existing KccState, so a
+        // second init (SetCongestionControl switching algorithms, or a
+        // migration ApplyCheckpoint that re-inits the plugin) must not inherit
+        // ANY estimator/recovery field from the previous epoch: a stale
+        // packet_conservation / prev_ca_state / full_bw / delivered round
+        // would keep the new epoch's window frozen (audit A, batch 5).
+        k->x_est = 0;
+        k->qdelay_avg = 0;
+        k->jitter_ewma = 0;
+        k->sample_cnt = 0;
+        k->min_rtt_stamp = 0;
+        k->mr_update_rtt_cnt = 0;
+        k->rtt_cnt = 0;
+        k->confirm_cnt = 0;
+        k->confirm_slow_cnt = 0;
+        k->locked = 0;
+        k->locked_high_cnt = 0;
+        k->round_rtt_min = kMinRttUninit;
+        k->prev_round_rtt_min = kMinRttUninit;
+        k->min_rtt_fast_fall_cnt = 0;
+        k->x_est_fall_cnt = 0;
+        k->srtt_guard_cnt = 0;
+        k->srtt_suppress_cnt = 0;
+        k->bw_sample_count = 0;
+        k->bw_sample_cur = 0;
+        k->max_bw = 0;
+        k->cycle_idx = 0;
+        k->cycle_mstamp_us = 0;
+        k->full_bw_reached = 0;
+        k->full_bw = 0;
+        k->full_bw_cnt = 0;
+        k->has_seen_rtt = 0;
+        k->prev_ack_us = 0;
+        k->last_ack_us = 0;
+        k->total_delivered = 0;
+        k->prev_delivered = 0;
+        // Kernel kcc_init recovery interaction (tcp_kcc.c:5490-5510): a new
+        // epoch starts in Open with no pending reduction and no saved window.
+        k->prev_ca_state = 0;
+        k->packet_conservation = 0;
+        k->prior_cwnd = 0;
+
         k->mode = kModeStartup;
         k->pacing_gain = kHighGain;
         k->cwnd_gain = kHighGain;
@@ -823,6 +867,7 @@ namespace {
             k->prev_round_rtt_min = k->round_rtt_min;
             k->round_rtt_min = kMinRttUninit;
             ++k->rtt_cnt;
+            k->packet_conservation = 0;
         }
         UInt64 bw = 0;
         if (0 < delivered && 0 < interval_us) {
@@ -1060,8 +1105,10 @@ namespace {
     }
 
     /**
-     * @brief Kernel kcc_set_state: entering CA_Loss invalidates the full-pipe
-     *        verdict (the path is no longer known to be filled).
+     * @brief Kernel kcc_set_state (tcp_kcc.c:5657-5667): entering CA_Loss
+     *        invalidates the full-pipe verdict AND records the state so
+     *        kcc_set_cwnd_to_recover_or_restore can later see the
+     *        Loss -> Open transition and restore prior_cwnd.
      */
     void KccSetState(XtcpConnCc* sk, Byte new_state) noexcept {
         if (NULLPTR == sk || 4 != new_state) {
@@ -1069,6 +1116,21 @@ namespace {
         }
         KccState* k = Priv(sk);
         if (NULLPTR != k) {
+            // Kernel kcc->prev_ca_state = TCP_CA_Loss. WITHOUT this write the
+            // port's kcc_set_cwnd_to_recover_or_restore never observes
+            // `prev_state >= Recovery && state < Recovery` after a loss episode
+            // (cc_kcc.cpp:957), so KCC never runs the kernel's Loss->Open
+            // bookkeeping: packet_conservation is left set and the window is
+            // never restored to prior_cwnd at the episode exit. Measured on a
+            // REAL loss (probe34, real handshake, Eifel correctly rejecting the
+            // undo): KCC exits the episode at cwnd 4 -> 14 by BDP re-growth
+            // while Reno exits at 2 -> 5 (audit D07).
+            k->prev_ca_state = 4;   // TCP_CA_Loss
+            // Kernel also sets round_start = 1 and runs
+            // kcc_lt_bw_sampling(sk, {.losses = 1}); the port has no LT-BW
+            // sampler, so only the round boundary is mirrored: a loss starts a
+            // new delivered round, exactly like kcc_update_bw's round_start.
+            k->next_rtt_delivered = 0;
             k->full_bw = 0;
             k->full_bw_cnt = 0;
         }

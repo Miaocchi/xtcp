@@ -771,7 +771,7 @@ namespace xtcp {
                             out.sack[b][0] = Load32(data + off + 2 + b * 8);
                             out.sack[b][1] = Load32(data + off + 6 + b * 8);
                         }
-                        // RFC 2018 搂3: the first SACK block is the most
+                        // RFC 2018 闂?: the first SACK block is the most
                         // recently received block, so a compliant peer may
                         // send blocks most-recent-first. The sender-side
                         // recovery walk (RetransmitEarliestMissing) iterates
@@ -861,6 +861,19 @@ namespace xtcp {
             }
         }
 
+        void TcpConn::ClearAppLimitedMarker() noexcept {
+            // Kernel tcp_rate_gen (tcp_rate_66.c:123-125):
+            //   if (tp->app_limited && after(tp->delivered, tp->app_limited))
+            //       tp->app_limited = 0;
+            // after() is the 32-bit wrapping comparison, hence the Int32 cast
+            // of the UInt32 difference. Both the marker and the comparison
+            // are in the PACKET domain (tp->delivered counts skb pcount).
+            if (0 != cc_.app_limited &&
+                static_cast<Int32>(static_cast<UInt32>(cc_.delivered_pkts) - cc_.app_limited) > 0) {
+                cc_.app_limited = 0;
+            }
+        }
+
         UInt32 TcpConn::PacingEdtUs(TimePoint now) const noexcept {
             // Kernel interval_to_edt (tcp_kcc.c:5019-5022):
             //   edt_ns = max(tp->tcp_wstamp_ns, now_ns)
@@ -894,6 +907,9 @@ namespace xtcp {
             window_ = kDefaultWindow;
             rcv_wnd_ = kDefaultWindow;
             snd_wnd_ = kDefaultWindow;
+            // Kernel tp->max_window starts at the SYN's advertised window
+            // (tcp_input_66.c:6409) and only grows (tcp_input_66.c:3596-3597).
+            max_window_ = kDefaultWindow;
             // RFC 6928 (Linux initcwnd): initial window = 10 segments at
             // MSS 1460; ssthresh starts unlimited (slow start first).
             cc_.snd_cwnd = 10;
@@ -1126,7 +1142,7 @@ namespace xtcp {
                 out[n * 2 + 1] = cur_right;
                 ++n;
             }
-            // RFC 2018 搂3: the first SACK block must be the most recently
+            // RFC 2018 闂?: the first SACK block must be the most recently
             // received block. ooo_ is keyed by seq (no insertion order), so
             // approximate "most recent" with the largest-seq block - the last
             // emitted (blocks above are ascending). Swap it into slot 0.
@@ -1193,6 +1209,16 @@ namespace xtcp {
          */
         void TcpConn::EmitRateSample(TimePoint now, UInt32 acked, UInt32 rtt_sample,
                                     UInt64 prior_in_flight_bytes, UInt32 ack) noexcept {
+            // Kernel tcp_rate_gen (tcp_rate_66.c:123-125) runs on EVERY ACK,
+            // cumulative or duplicate, and its FIRST statement clears the
+            // app-limited marker:
+            //   if (tp->app_limited && after(tp->delivered, tp->app_limited))
+            //       tp->app_limited = 0;
+            // The port used to clear it only inside the cumulative-ACK branch,
+            // so a SACK/DSACK-only dup-ACK left a stale marker latched and the
+            // next emitted segment carried is_app_limited=1 (tcp_rate_66.c:69)
+            // although the bubble had been ACKed and gone (A2/A3).
+            ClearAppLimitedMarker();
             if (0 == last_rate_sample_) {
                 // First cumulative ACK: establish the sample base (this
                 // ACK's bytes fold into the next sample's window). A
@@ -1293,7 +1319,7 @@ namespace xtcp {
                 rto_deadline_ = 0;
                 return;
             }
-            // RFC 1122 搂4.2.2.17: a retransmission must fit the peer's
+            // RFC 1122 闂?.2.2.17: a retransmission must fit the peer's
             // advertised window. A zero window takes no data - the persist
             // probe owns that state, so skip the transmit (re-arm below) and
             // wait for a window-opening ACK instead of emitting an out-of-
@@ -1408,6 +1434,11 @@ namespace xtcp {
                 seg.sent_delivered = cc_.delivered;
                 seg.sent_delivered_pkts = cc_.delivered_pkts;
                 seg.pkt_count = PktCount(seg.len, peer_mss_);
+                // Kernel tcp_retransmit_skb (tcp_output_66.c:3325):
+                //   tp->total_retrans += segs;
+                // segs = tcp_skb_pcount(skb), i.e. the PACKET domain. The
+                // DSACK credibility gate compares dsack_dups against it.
+                total_retrans_pkts_ += seg.pkt_count;
                 seg.app_limited = (0 != cc_.app_limited) ? 1 : 0;
                 seg.is_retrans = 1;
                 seg.rto = (0 == seg.rto) ? rto_ : seg.rto;
@@ -1445,6 +1476,33 @@ namespace xtcp {
                 // touched here: a retransmission is not a loss verdict (the
                 // loss decision marks it).
                 retrans_out_pkts_ += seg.pkt_count;
+                // Kernel tcp_output_66.c:3461-3462 (tcp_xmit_retransmit_queue,
+                // i.e. every RETRANSMISSION actually put on the wire):
+                //     if (tcp_in_cwnd_reduction(sk))
+                //         tp->prr_out += tcp_skb_pcount(skb);
+                // This is the second of the kernel's two prr_out increments
+                // (the first is tcp_write_xmit, tcp_output_66.c:2787-2789,
+                // mirrored by SendData/FlushPendingSend). Without it a
+                // retransmission-driven recovery never spends PRR credit, so
+                // `cwnd = ssthresh + delivered - out` climbs with every ACK and
+                // PRR stops pacing the recovery (audit review batch 4, D).
+                if (fast_recovery_) {
+                    prr_out_ += seg.pkt_count;
+                }
+                // Kernel tcp_output_66.c:3390-3392 (every retransmission that
+                // actually leaves the wire):
+                //   if (tp->undo_retrans < 0) tp->undo_retrans = 0;
+                //   tp->undo_retrans += tcp_skb_pcount(skb);
+                // The entry assignment (CutCwnd, kernel tcp_init_undo
+                // tcp_input.c:2106-2111) runs BEFORE this retransmit, so a
+                // no-SACK dup-ACK entry starts at -1 and only this increment
+                // makes the counter positive - which is what makes
+                // tcp_may_undo (tcp_input.c:2530-2533) refuse the undo without
+                // TSopt evidence. Without it a REAL loss is undone (a4rev54).
+                if (undo_retrans_ < 0) {
+                    undo_retrans_ = 0;
+                }
+                undo_retrans_ += static_cast<Int32>(seg.pkt_count);
                 // Emit LAST: the nested reentry must observe a consistent
                 // (already-updated) retransmit state.
                 sink_(std::move(copy));
@@ -1535,6 +1593,9 @@ namespace xtcp {
                     ns.lost = seg.lost;
                     ns.app_limited = seg.app_limited;
                     ns.is_retrans = seg.is_retrans;
+                    // A split inherits the retired retrans_out accounting:
+                    // the pop path must not decrement it again.
+                    ns.retrans_out_retired = seg.retrans_out_retired;
                     ns.data = BuildSegmentPacket(local_, remote_, ns.seq, rcv_nxt_,
                                                  kFlagAck,
                                                  payload + off, chunk,
@@ -1622,7 +1683,7 @@ namespace xtcp {
                                       static_cast<UInt16>(window_ >> kWindowScaleOffer), sink_,
                                       kWindowScaleOffer, Md5Key(), Md5KeyLen(), NULLPTR, 0, NULLPTR);
                 }
-                // RFC 1122 搂4.2.3.5: handshake retransmits back off
+                // RFC 1122 闂?.2.3.5: handshake retransmits back off
                 // exponentially, mirroring RetransmitFront's seg.rto doubling
                 // (tcp_fsm.cpp:1075-1082) - a fixed rto_ re-arm fires the whole
                 // syn_retries_ budget at a constant 1 s (Linux ~127 s for 6
@@ -1661,7 +1722,7 @@ namespace xtcp {
                                   NULLPTR, 0, AdvertisedWindow(), sink_, rcv_wscale_,
                                   Md5Key(), Md5KeyLen(), NULLPTR, 0, cookie, false,
                                   false, 0, 0, !sack_ok_);
-                // RFC 1122 搂4.2.3.5: the SYN+ACK retransmit backs off
+                // RFC 1122 闂?.2.3.5: the SYN+ACK retransmit backs off
                 // exponentially (mirror of RetransmitFront seg.rto doubling,
                 // tcp_fsm.cpp:1075-1082), not a fixed rto_ re-arm.
                 syn_rto_ = (0 == syn_rto_) ? rto_ : syn_rto_;
@@ -1706,7 +1767,7 @@ namespace xtcp {
                 }
                 ++syn_retry_count_;
                 SendSegment(snd_nxt_ - 1, rcv_nxt_, kFlagFin | kFlagAck, NULLPTR, 0);
-                // RFC 1122 搂4.2.3.5: the FIN retransmit backs off exponentially
+                // RFC 1122 闂?.2.3.5: the FIN retransmit backs off exponentially
                 // (mirror of RetransmitFront seg.rto doubling, tcp_fsm.cpp:1081-1087). With a fixed rto_ re-arm the close gave up after
                 // 15 s (15 x 1 s); now it doubles 1,2,4,... capped at 60 s.
                 fin_rto_ = (0 == fin_rto_) ? rto_ : fin_rto_;
@@ -1738,8 +1799,30 @@ namespace xtcp {
                 prior_cwnd_ = cc_.snd_cwnd;
                 prior_ssthresh_ = cc_.snd_ssthresh;
             }
+            // RFC 3522 adjudication bases (kernel tp->retrans_stamp,
+            // tcp_input.c:2454-2457): the FIRST retransmission's TSval of this
+            // episode is the reference. Successive RTOs must refresh the TSval
+            // they PUT ON THE WIRE (RFC 7323 s5.3 needs a new TSval per
+            // retransmission, so rto_ts_val_ is rewritten below) but must NOT
+            // advance the reference - otherwise an ACK echoing the first
+            // retransmission would look "older than the latest" and a real loss
+            // would be declared spurious (audit D03).
+            if (!rto_pending_) {
+                retrans_stamp_ts_ = 0;   // new episode: no reference yet
+            }
             rto_ts_val_ = static_cast<UInt32>(NowUs() / 1000);
+            if (0 == retrans_stamp_ts_) {
+                retrans_stamp_ts_ = rto_ts_val_;
+            }
             rto_pending_ = true;
+            // The sequence end of the segment this RTO is about to retransmit:
+            // a cumulative ACK reaching it answers the "spurious?" question even
+            // when the peer never negotiated TSopt, so rto_pending_ can never be
+            // pinned forever (audit D04). RetransmitFront may truncate to the
+            // peer window; using the full segment end is conservative (the
+            // adjudication simply waits for the rest of the segment).
+            rto_retx_end_ = retrans_queue_.empty()
+                ? 0 : (retrans_queue_.front().seq + retrans_queue_.front().len);
             // Kernel tcp_timeout_mark_lost (tcp_input.c:1121): the RTO marks
             // the unacknowledged head as lost BEFORE the window cut, so
             // lost_out reflects the verdict even if the retransmit is skipped
@@ -2183,6 +2266,86 @@ namespace xtcp {
             }
         }
 
+        void TcpConn::EndCwndReduction() noexcept {
+            // Kernel tcp_end_cwnd_reduction (tcp_input.c:2669-2683), verbatim
+            // in structure:
+            //
+            //   if (icsk_ca_ops->cong_control)
+            //       return;
+            //   if (tp->snd_ssthresh < TCP_INFINITE_SSTHRESH &&
+            //       (icsk_ca_state == TCP_CA_CWR || tp->undo_marker)) {
+            //       tcp_snd_cwnd_set(tp, tp->snd_ssthresh);
+            //   }
+            //   tcp_ca_event(sk, CA_EVENT_COMPLETE_CWR);
+            //
+            // Three guards matter and all three were missing from the
+            // dfe0b55 exit block:
+            //
+            //   1. cong_control: a rate-based algorithm owns the window
+            //      (KCC/BBR compute it from the rate sample). The kernel does
+            //      not touch cwnd for them - and does not even dispatch the
+            //      event. Writing cwnd = snd_ssthresh here would hand KCC
+            //      0x7FFFFFFF (KccSsthresh passes the sentinel through,
+            //      cc_kcc.cpp:1042) which then only survives until the next
+            //      KccMain clamps it to the BDP target: the pre-recovery
+            //      window is lost (audit D01).
+            //
+            //   2. snd_ssthresh < TCP_INFINITE_SSTHRESH: the sentinel means
+            //      "no reduction was ever recorded"; collapsing cwnd to it is
+            //      the 0x7FFFFFFF window.
+            //
+            //   3. state == CWR || the episode was not undone: only an episode
+            //      that actually reduced the window ends at ssthresh. A
+            //      Recovery episode that was undone keeps prior_cwnd_ instead.
+            //
+            // The port's undo_marker_ cannot express the kernel's
+            // `tp->undo_marker` here: the SACK entry sets it false (no undo
+            // candidate), which would disable the collapse for every
+            // SACK-confirmed recovery (review batch1 defect 2). episode_undone_
+            // tracks the kernel's "undo_marker == 0" exactly: false while the
+            // episode still stands, true once an undo restored the window.
+            if (NULLPTR != cc_ops_ && NULLPTR != cc_ops_->cong_control) {
+                return;   // rate-based CC owns cwnd (kernel: early return)
+            }
+            if (cc_.snd_ssthresh < 0x7FFFFFFFu &&
+                (2 == cc_.ca_state || !episode_undone_)) {
+                cc_.snd_cwnd = cc_.snd_ssthresh;
+            }
+            // Kernel tcp_ca_event(CA_EVENT_COMPLETE_CWR): the episode is over,
+            // the CC may leave its "in recovery" bookkeeping (CUBIC's
+            // in_recovery, an out-of-tree port's epoch marker).
+            if (NULLPTR != cc_ops_ && NULLPTR != cc_ops_->cwnd_event) {
+                cc_ops_->cwnd_event(&cc_, cc::kCaEventCompleteCwr);
+            }
+        }
+
+        bool TcpConn::TcpMayUndo(const TcpOpts* opts) noexcept {
+            // Kernel tcp_may_undo (tcp_input.c:2530-2533):
+            //   return tp->undo_marker &&
+            //          (!tp->undo_retrans || tcp_packet_delayed(tp));
+            //
+            // Port adaptation (see the batch-2 preamble in designA4_fix.md):
+            // the port omits TSopt on data segments by design (tcp_fsm.cpp:
+            // 999-1004, 2351-2357), so tcp_packet_delayed can never produce
+            // valid evidence here. The kernel's INTENT is "do not undo while
+            // retransmissions are still in flight - their D-SACKs may yet prove
+            // the cut was wrong". That is exactly undo_retrans_ > 0:
+            //
+            //   undo_retrans_ == -1  nothing was retransmitted at entry
+            //                        (kernel `retrans_out ?: -1`): the port's
+            //                        documented no-SACK clean-exit undo applies.
+            //   undo_retrans_ == 0   every retransmission was already ACKed:
+            //                        undo is safe.
+            //   undo_retrans_  > 0   a retransmission is still outstanding:
+            //                        refuse (conservative; the kernel would only
+            //                        allow it with TSopt evidence we cannot get).
+            (void)opts;
+            if (!undo_marker_) {
+                return false;
+            }
+            return undo_retrans_ <= 0;
+        }
+
         void TcpConn::CutCwnd() noexcept {
             // RFC 5681: ssthresh = max(FlightSize/2, 2*SMSS) on loss. Packets
             // units: half of the in-flight window, at least two segments.
@@ -2223,6 +2386,16 @@ namespace xtcp {
                 }
             }
             cc_.snd_cwnd_cnt = 0;
+            // Kernel tcp_init_undo (tcp_input.c:2106-2111): remember how many
+            // retransmissions are still in flight so tcp_may_undo can require
+            // TSopt evidence before undoing. -1 = "nothing retransmitted".
+            undo_retrans_ = (retrans_out_pkts_ > 0)
+                ? static_cast<Int32>(retrans_out_pkts_) : -1;
+            // A fresh cwnd-reduction episode: nothing has been undone yet.
+            // CutCwnd is the common entry for the dup-ACK, RACK and RTO paths
+            // (kernel tcp_init_undo is called from tcp_enter_loss /
+            // tcp_enter_recovery), so this one write covers all three.
+            episode_undone_ = false;
         }
 
         void TcpConn::RetransmitEarliestMissing(TimePoint now, const TcpOpts* opts) noexcept {
@@ -2281,7 +2454,7 @@ namespace xtcp {
                         // SACK block (stale, or landed exactly on a block's
                         // left edge after a single-segment gap retransmit):
                         // jump to the current gap's start - never retransmit
-                        // already-received data (RFC 6675 搂4).
+                        // already-received data (RFC 6675 闂?).
                         missing = static_cast<UInt32>(cursor);
                         break;
                     }
@@ -2316,14 +2489,14 @@ namespace xtcp {
                 // Find the queued segment covering the missing sequence.
                 for (SentSeg& seg : retrans_queue_) {
                     if (!SeqLt(missing, seg.seq) && SeqLt(missing, seg.seq + seg.len)) {
-                        // RFC 1122 搂4.2.2.17: the retransmission must fit the
+                        // RFC 1122 闂?.2.2.17: the retransmission must fit the
                         // peer's advertised window. A zero window takes no data -
                         // skip the transmit and wait for a window-opening ACK (the
                         // persist probe, when armed, re-arms the RTO path).
                         if (0 == snd_wnd_) {
                             return;
                         }
-                        // RFC 6675 搂4: retransmit ONLY the missing interval, not
+                        // RFC 6675 闂?: retransmit ONLY the missing interval, not
                         // the whole queued segment. When the missing point lies
                         // inside the segment, the prefix [seg.seq, missing) is
                         // already SACKed/delivered - resending it makes the peer
@@ -2445,6 +2618,24 @@ namespace xtcp {
                             // packets actually retransmitted and still in flight;
                             // lost_out is untouched here.
                             retrans_out_pkts_ += seg.pkt_count;
+                            // Kernel tcp_retransmit_skb (tcp_output_66.c:3325):
+                            // tp->total_retrans += tcp_skb_pcount(skb).
+                            total_retrans_pkts_ += seg.pkt_count;
+                            // Kernel tcp_output_66.c:3461-3462: a retransmission
+                            // spends PRR credit as well (tcp_xmit_retransmit_queue
+                            // does `tp->prr_out += tcp_skb_pcount(skb)` while the
+                            // connection is in cwnd reduction). See the note in
+                            // RetransmitFront (audit review batch 4, D).
+                            if (fast_recovery_) {
+                                prr_out_ += seg.pkt_count;
+                            }
+                            // Kernel tcp_output_66.c:3390-3392: every
+                            // retransmission that leaves the wire increments
+                            // undo_retrans (see the note in RetransmitFront).
+                            if (undo_retrans_ < 0) {
+                                undo_retrans_ = 0;
+                            }
+                            undo_retrans_ += static_cast<Int32>(seg.pkt_count);
                             // Emit LAST: the nested reentry (above) must observe a
                             // consistent (already-updated) retransmit state.
                             sink_(std::move(copy));
@@ -2472,7 +2663,23 @@ namespace xtcp {
             // replaces the 3-dup-ACK threshold for SACK connections (the
             // time-based signal is loss, not order). Enter recovery like the
             // dup-ACK path and retransmit the earliest missing segment.
-            if (!sack_ok_ || 0 == rack_seq_ || fast_recovery_ || retrans_queue_.empty()) {
+            // Gate: a pending RTO episode owns the loss verdict until Eifel
+            // has adjudicated it (rto_pending_), and CA_Loss is driven by
+            // tcp_process_loss in the kernel (tcp_input.c:2845-2896), NOT by
+            // tcp_enter_recovery. Entering Recovery from CA_Loss here would
+            // overwrite prior_cwnd_/prior_ssthresh_ with the ALREADY-CUT
+            // window and reset high_seq_ to a value the RTO episode did not
+            // choose - the subsequent spurious-RTO undo then restores the
+            // wrong window (audit D11).
+            // CA_CWR is equally protected: kernel tcp_enter_recovery is guarded
+            // by `!tcp_in_cwnd_reduction(sk)` (tcp_input_66.c:2834-2839), and
+            // tcp_in_cwnd_reduction covers BOTH CWR and Recovery
+            // (tcp_66.h:1245-1249). During CWR the reduction snapshot already
+            // exists, so a RACK verdict must not run tcp_init_cwnd_reduction a
+            // second time and halve ssthresh again (audit B).
+            if (!sack_ok_ || 0 == rack_seq_ || fast_recovery_ ||
+                2 == cc_.ca_state || 4 == cc_.ca_state || rto_pending_ ||
+                retrans_queue_.empty()) {
                 return;
             }
             bool lost = false;
@@ -2501,8 +2708,19 @@ namespace xtcp {
             // Capture the pre-cut window BEFORE the cut so a D-SACK
             // (RFC 2883) can undo a spurious RACK verdict - capturing after
             // the cut would record the halved value and the undo would no-op.
-            prior_cwnd_ = cc_.snd_cwnd;
-            prior_ssthresh_ = cc_.snd_ssthresh;
+            // First-save gate (mirror of the RTO path at tcp_fsm.cpp:1764):
+            // a RACK entry during an episode that already owns prior_cwnd_
+            // must not replace it (audit D11).
+            if (!fast_recovery_ && !rto_pending_) {
+                prior_cwnd_ = cc_.snd_cwnd;
+                prior_ssthresh_ = cc_.snd_ssthresh;
+            }
+            // A new episode owns its own RTO verdict: an RTO retrans_stamp left
+            // over from an earlier episode must not be adjudicated against this
+            // one (kernel clears retrans_stamp on the recovery entry paths).
+            rto_pending_ = false;
+            rto_retx_end_ = 0;
+            retrans_stamp_ts_ = 0;
             // Route the cut through CutCwnd: the inline half-cut
             // here bypassed the CC plugin's ssthresh hook and kCaEventLoss -
             // dup-ACK (CutCwnd at OnAckReceived) and RTO (CutCwnd at
@@ -2514,8 +2732,15 @@ namespace xtcp {
             high_seq_ = snd_nxt_;
             fast_recovery_ = true;
             // Mirror of the dup-ACK entry: PRR's flight-size anchor plus the
-            // retransmission cursor (the earliest missing segment).
-            recover_fs_ = snd_nxt_ - snd_una_;
+            // retransmission cursor (the earliest missing segment). PACKETS
+            // (kernel tp->recover_fs = tcp_packets_in_flight), and the PRR
+            // counters restart for this episode (kernel tcp_init_cwnd_reduction
+            // clears prr_delivered/prr_out at EVERY recovery entry; audit D09:
+            // this RACK entry used to leave the previous episode's counters in
+            // place).
+            recover_fs_ = PktCount(snd_nxt_ - snd_una_, peer_mss_);
+            prr_delivered_ = 0;
+            prr_out_ = 0;
             sack_retx_next_ = snd_una_;
             last_retx_seq_ = 0;  // storm gate: allow the entry retransmit
             last_retx_len_ = 0;
@@ -2567,13 +2792,34 @@ namespace xtcp {
                 // delivery on every dup-ACK: tp->delivered inflates, the rate
                 // sample reports bandwidth, and cwnd grows on a lossless link
                 // (test_reorder_gate s2: cwnd 12->13 with zero real delivery).
-                if (!SeqLt(ack, opts->sack[0][1])) {
-                    const UInt32 ds_len = opts->sack[0][1] - opts->sack[0][0];
-                    const UInt32 dup_segs = (0 < peer_mss_ && ds_len > peer_mss_)
-                        ? ((ds_len + peer_mss_ - 1) / peer_mss_) : 1u;
-                    dsack_dups_ += dup_segs;
-                    if (dsack_dups_ <= retransmit_count_) {
-                        sack_new_pkts += dup_segs;
+                // Kernel tcp_dsack_seen (tcp_input_66.c:1009-1046) verbatim in
+                // order:
+                //   1. `if (!before(start_seq, end_seq)) return 0;`  - empty or
+                //      reversed blocks are rejected FIRST, before any counter
+                //      moves (so they cannot poison dsack_dups).
+                //   2. seq_len = end_seq - start_seq;
+                //   3. `if (seq_len > tp->max_window) return 0;` - dubious.
+                //   4. dup_segs = DIV_ROUND_UP(seq_len, mss) (1 when short).
+                //   5. tp->dsack_dups += dup_segs; `if (tp->dsack_dups >
+                //      tp->total_retrans) return 0;` - the sender never
+                //      retransmitted that much, so the spurious-retransmission
+                //      claim is bogus (repeated or forged stale SACK block).
+                //   6. state->sack_delivered += dup_segs.
+                // total_retrans is the PACKET-domain counter
+                // (tcp_output_66.c:3325 `tp->total_retrans += segs`), not the
+                // number of retransmission events: one TSO retransmission is
+                // several packets.
+                const UInt32 ds_sl = opts->sack[0][0];
+                const UInt32 ds_sr = opts->sack[0][1];
+                if (!SeqLt(ack, ds_sr) && SeqLt(ds_sl, ds_sr)) {
+                    const UInt32 ds_len = ds_sr - ds_sl;
+                    if (ds_len <= max_window_) {
+                        const UInt32 dup_segs = (0 < peer_mss_ && ds_len > peer_mss_)
+                            ? ((ds_len + peer_mss_ - 1) / peer_mss_) : 1u;
+                        dsack_dups_ += dup_segs;
+                        if (dsack_dups_ <= total_retrans_pkts_) {
+                            sack_new_pkts += dup_segs;
+                        }
                     }
                 }
                 for (Byte b = 0; b < opts->sack_count; ++b) {
@@ -2609,6 +2855,35 @@ namespace xtcp {
                                 // segment is not delivered yet.
                                 if (before < seg.len && seg.len <= seg.sacked) {
                                     sack_new_pkts += PktCount(seg.len, peer_mss_);
+                                    // Kernel tcp_sacktag_one retires the loss
+                                    // and retransmission tags when the skb
+                                    // becomes SACKED_ACKED (tcp_input_66.c:
+                                    // 1392-1396 / 1414-1417):
+                                    //   if (sacked & TCPCB_LOST) {
+                                    //       sacked &= ~TCPCB_LOST;
+                                    //       tp->lost_out -= pcount;
+                                    //   }
+                                    // and, for a skb that was both LOST and
+                                    // SACKED_RETRANS, retrans_out -= pcount
+                                    // as well. The old code only decremented
+                                    // lost_out when the segment was popped, so
+                                    // a SACKed loss stayed in lost_out forever
+                                    // (app_limited cond4 lost_out<=retrans_out
+                                    // never held again).
+                                    if (0 != seg.lost) {
+                                        seg.lost = 0;
+                                        lost_out_pkts_ = (lost_out_pkts_ >= seg.pkt_count)
+                                            ? lost_out_pkts_ - seg.pkt_count : 0;
+                                        // Kernel clears TCPCB_SACKED_RETRANS
+                                        // together with LOST: the retransmit
+                                        // is no longer in flight.
+                                        if (0 != seg.is_retrans &&
+                                            0 == seg.retrans_out_retired) {
+                                            seg.retrans_out_retired = 1;
+                                            retrans_out_pkts_ = (retrans_out_pkts_ >= seg.pkt_count)
+                                                ? retrans_out_pkts_ - seg.pkt_count : 0;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2618,6 +2893,12 @@ namespace xtcp {
                 // and BEFORE the cumulative-ACK add below (kernel order).
                 cc_.delivered_pkts += sack_new_pkts;
             }
+            // Kernel tcp_rate_gen clears the app-limited marker on EVERY ACK
+            // (tcp_rate_66.c:123-125), a SACK/DSACK-only duplicate ACK
+            // included. This runs before the branch's flush so a segment the
+            // ACK emits cannot carry a stale is_app_limited snapshot (A2/A3);
+            // EmitRateSample re-runs it after the cumulative-ACK delivery add.
+            ClearAppLimitedMarker();
             // RFC 8985 RACK: the most recently delivered segment anchors the
             // time-based loss detection. "Delivered" = acknowledged by the
             // cumulative ACK or SACKed. The anchor is the HIGHEST delivered
@@ -2708,14 +2989,23 @@ namespace xtcp {
                         cc_.snd_ssthresh = prior_ssthresh_;
                     }
                     undo_marker_ = false;
+                    episode_undone_ = true;  // kernel tcp_undo_cwnd_reduction: undo_marker = 0
                     fast_recovery_ = false;
                     sack_retx_next_ = 0;
                     dup_acks_ = 0;
-                    // Kernel tcp_try_undo_dsack -> tcp_try_keep_open: the
-                    // recovery is undone, so the CA state leaves Recovery.
+                    // Kernel tcp_try_undo_dsack -> tcp_undo_cwnd_reduction ->
+                    // tcp_try_keep_open: the recovery is undone, so the CA
+                    // state leaves Recovery (tcp_try_keep_open picks Open or
+                    // Disorder; the port has no Disorder state, so Open).
                     if (3 == cc_.ca_state) {
                         SetCaState(0);
                     }
+                    high_seq_ = 0;   // episode over: a stale high_seq_ would
+                                     // re-fire the exit block on the next ACK
+                    // No RTO verdict can outlive its episode.
+                    rto_pending_ = false;
+                    rto_retx_end_ = 0;
+                    retrans_stamp_ts_ = 0;
                     ++dsack_undos_;
                 }
             }
@@ -2728,8 +3018,49 @@ namespace xtcp {
             // state (CUBIC's wmax/epoch) inconsistent. The half-cut below is
             // the Reno-only path (no plugin). The once-per-RTT throttle and
             // the CWR echo are core behavior in both cases.
+            //
+            // Kernel tcp_fastretrans_alert part A (tcp_input.c:2986-2987):
+            //   if (ece_ack) tp->prior_ssthresh = 0;
+            // Congestion is PROVEN, so the episode may never be undone. The
+            // port expressed that as "no undo candidate"; keep it as a
+            // prior_ssthresh_ reset too so the undo branches' guard
+            // (`prior_ssthresh_ > snd_ssthresh`) is a no-op afterwards. This
+            // runs for EVERY ECE ACK, not only the throttled one: the kernel
+            // does not throttle part A either.
+            if (ece && ecn_active_) {
+                prior_ssthresh_ = 0;
+                undo_marker_ = false;
+                undo_retrans_ = -1;
+                // Congestion is proven: no RTO verdict from an earlier episode
+                // may survive into the CWR episode.
+                rto_pending_ = false;
+                rto_retx_end_ = 0;
+                retrans_stamp_ts_ = 0;
+            }
             if (ece && ecn_active_ &&
                 (0 == ecn_reduce_at_ || now - ecn_reduce_at_ >= srtt_)) {
+                // Kernel tcp_enter_cwr (tcp_input.c:2686-2697):
+                //   prior_ssthresh = 0;
+                //   if (icsk_ca_state < TCP_CA_CWR) {
+                //       undo_marker = 0;
+                //       tcp_init_cwnd_reduction(sk);   // high_seq/prior_cwnd/prr_*
+                //       tcp_set_ca_state(sk, TCP_CA_CWR);
+                //   }
+                // tcp_init_cwnd_reduction runs the ssthresh hook BEFORE the
+                // state change (tcp_input.c:2629-2641), so the hook still sees
+                // the pre-CWR state - keep that order below.
+                const bool enter_cwr = (cc_.ca_state < 2);
+                if (enter_cwr) {
+                    // tcp_init_cwnd_reduction: snapshot the window BEFORE the
+                    // cut, anchor the episode at snd_nxt and restart PRR.
+                    prior_cwnd_ = cc_.snd_cwnd;
+                    high_seq_ = snd_nxt_;
+                    prr_delivered_ = 0;
+                    prr_out_ = 0;
+                    // PACKETS (kernel tp->recover_fs = tcp_packets_in_flight).
+                    recover_fs_ = PktCount(snd_nxt_ - snd_una_, peer_mss_);
+                    episode_undone_ = false;  // fresh CWR episode: no undo yet
+                }
                 if (NULLPTR != cc_ops_) {
                     if (NULLPTR != cc_ops_->cwnd_event) {
                         cc_ops_->cwnd_event(&cc_, cc::kCaEventEcnCe);
@@ -2763,6 +3094,11 @@ namespace xtcp {
                     }
                     cc_.snd_cwnd_cnt = 0;
                 }
+                if (enter_cwr) {
+                    // tcp_enter_cwr's tail: the state transition LAST, so the
+                    // ssthresh hook observed the pre-CWR state (kernel order).
+                    SetCaState(2);   // kernel tcp_set_ca_state(TCP_CA_CWR)
+                }
                 ecn_reduce_at_ = now;
                 cwr_pending_ = true;
             }
@@ -2781,21 +3117,58 @@ namespace xtcp {
                 return;
             }
             if (ack != snd_una_) {
-                // RFC 3522 Eifel: an RTO retransmission is awaiting its ACK.
-                // If the ACK echoes the ORIGINAL (pre-RTO) TSval instead of
-                // the retransmission's, the RTO was spurious (the peer merely
-                // reordered or delayed its ACK) - restore the pre-cut window.
-                if (rto_pending_ && timestamps_ok_ && NULLPTR != opts && opts->has_timestamp) {
-                    if (opts->ts_ecr != rto_ts_val_) {
-                        cc_.snd_cwnd = prior_cwnd_;
-                        cc_.snd_ssthresh = prior_ssthresh_;
-                    }
-                    rto_pending_ = false;
-                    // Kernel tcp_try_undo_loss: a spurious RTO returns the CA
-                    // state to Open (tcp_set_ca_state(TCP_CA_Open)).
-                    if (4 == cc_.ca_state) {
-                        SetCaState(0);
-                        high_seq_ = 0;
+                // RFC 3522 Eifel: adjudicate the pending RTO once the ACK
+                // actually covers the retransmitted range (rto_retx_end_), or
+                // once the queue drained (nothing left to judge).
+                //
+                // Kernel tcp_packet_delayed (tcp_input.c:2437-2441):
+                //   retrans_stamp && tcp_tsopt_ecr_before(tp, retrans_stamp)
+                // tcp_tsopt_ecr_before (tcp_input.c:2418-2422):
+                //   saw_tstamp && rcv_tsecr && before(rcv_tsecr, when)
+                // i.e. the RTO is spurious ONLY when the echoed TSval is
+                // STRICTLY BEFORE the first retransmission's TSval. "Different"
+                // is not enough: an ACK for data sent AFTER the RTO echoes a
+                // NEWER TSval and must not undo a real loss (audit D03).
+                //
+                // Without TSopt the question cannot be answered positively, so
+                // the verdict is "real loss" (no undo) - but it IS answered, so
+                // rto_pending_ clears and the D-SACK gate reopens (audit D04).
+                if (rto_pending_) {
+                    const bool adjudicated =
+                        (0 != rto_retx_end_ && !SeqLt(ack, rto_retx_end_)) ||
+                        retrans_queue_.empty();
+                    if (adjudicated) {
+                        const bool have_ts = timestamps_ok_ && NULLPTR != opts &&
+                                             opts->has_timestamp && 0 != opts->ts_ecr;
+                        const bool spurious = have_ts && 0 != retrans_stamp_ts_ &&
+                                              SeqLt(opts->ts_ecr, retrans_stamp_ts_);
+                        if (spurious) {
+                            if (NULLPTR != cc_ops_ && NULLPTR != cc_ops_->undo_cwnd &&
+                                0 != prior_cwnd_) {
+                                cc_.snd_cwnd = cc_ops_->undo_cwnd(&cc_);
+                            } else {
+                                cc_.snd_cwnd = prior_cwnd_;
+                            }
+                            if (prior_ssthresh_ > cc_.snd_ssthresh) {
+                                cc_.snd_ssthresh = prior_ssthresh_;
+                            }
+                            episode_undone_ = true;  // kernel tcp_undo_cwnd_reduction
+                        }
+                        rto_pending_ = false;
+                        rto_retx_end_ = 0;
+                        retrans_stamp_ts_ = 0;
+                        // Kernel tcp_try_undo_loss: a spurious RTO returns the
+                        // CA state to Open (tcp_set_ca_state(TCP_CA_Open)).
+                        // A REAL loss stays in CA_Loss - kernel tcp_process_loss
+                        // keeps it there until snd_una reaches high_seq, and the
+                        // episode-exit block closes it then. The old code
+                        // cleared Loss on the first advancing ACK even when
+                        // snd_una was still below high_seq, which let a second
+                        // loss episode start from Open (audit D03/D04).
+                        if (spurious && 4 == cc_.ca_state) {
+                            SetCaState(0);
+                            high_seq_ = 0;
+                        }
                     }
                 }
                 // Cumulative ACK advanced: sample RTT from the oldest newly
@@ -2853,7 +3226,7 @@ namespace xtcp {
                             lost_out_pkts_ = (lost_out_pkts_ >= front.pkt_count)
                                 ? lost_out_pkts_ - front.pkt_count : 0;
                         }
-                        if (0 != front.is_retrans) {
+                        if (0 != front.is_retrans && 0 == front.retrans_out_retired) {
                             retrans_out_pkts_ = (retrans_out_pkts_ >= front.pkt_count)
                                 ? retrans_out_pkts_ - front.pkt_count : 0;
                         }
@@ -2959,10 +3332,9 @@ namespace xtcp {
                 // delivered passes it (after() comparison, not a raw >).
                 // The marker is latched in the PACKET domain, so the clear
                 // test must read delivered_pkts (same domain).
-                if (0 != cc_.app_limited &&
-                    static_cast<Int32>(static_cast<UInt32>(cc_.delivered_pkts) - cc_.app_limited) > 0) {
-                    cc_.app_limited = 0;
-                }
+                // NOTE: this clear now runs from EmitRateSample (the
+                // tcp_rate_gen equivalent) on EVERY ACK, SACK/DSACK-only
+                // duplicate ACKs included (tcp_rate_66.c:123-125).
                 if (0 < popped_count) {
                     if (newest_sent_delivered > batch_prior_delivered_) {
                         batch_prior_delivered_ = newest_sent_delivered;
@@ -2976,38 +3348,110 @@ namespace xtcp {
                     acked, popped_count, newest_len, batch_retrans_, prior_sacked_out,
                     ece, (NULLPTR != opts && 0 < opts->sack_count),
                     newest_sent_delivered, cc_.delivered, peer_mss_);
-                // Kernel tcp_fastretrans_alert (state exit, part D): a
-                // recovery/loss episode ends once snd_una reaches high_seq -
-                // the snd_nxt snapshot taken at the entry. The CA state MUST
-                // return to CA_Open BEFORE the CC hook runs: the kernel calls
-                // tcp_fastretrans_alert (state machine) and only afterwards
-                // tcp_rate_gen + tcp_cong_control (the CC hook). Without this
-                // transition a state-keying CC (kcc_set_cwnd_to_recover_or_
-                // restore) sees "Recovery entered" (prev=Open, state=Recovery)
-                // on EVERY later ACK and keeps re-cutting the window to
-                // inflight+acked - the window can never recover.
+                // Kernel tcp_fastretrans_alert part D (tcp_input.c:2996-3020):
+                // an episode ends when snd_una reaches high_seq. The CA state
+                // MUST return to CA_Open BEFORE the CC hook runs (the kernel
+                // runs tcp_fastretrans_alert first, then tcp_rate_gen +
+                // tcp_cong_control), and the window handling must follow
+                // tcp_end_cwnd_reduction's guards instead of an unconditional
+                // `cwnd = ssthresh` (audit D01/D13).
                 if (0 != high_seq_ && !SeqLt(snd_una_, high_seq_)) {
-                    if (fast_recovery_) {
-                        // Linux tcp_try_undo_recovery: a no-SACK entry whose
-                        // recovery completes cleanly restores the pre-cut
-                        // window; a confirmed-loss entry ends at ssthresh.
-                        if (undo_marker_) {
-                            cc_.snd_cwnd = prior_cwnd_;
-                            cc_.snd_ssthresh = prior_ssthresh_;
-                            undo_marker_ = false;
-                        } else {
-                            cc_.snd_cwnd = cc_.snd_ssthresh;
+                    if (2 == cc_.ca_state) {
+                        // Kernel part D, case TCP_CA_CWR (tcp_input.c:3003-3010):
+                        // CWR is held until something ABOVE high_seq is ACKed
+                        // (that is when the receiver has actually seen our CWR
+                        // bit). At exactly high_seq the episode stays open.
+                        // tcp_end_cwnd_reduction runs FIRST, while the state is
+                        // still CWR (the event observes state 2), then Open.
+                        if (snd_una_ != high_seq_) {
+                            EndCwndReduction();
+                            SetCaState(0);
+                            high_seq_ = 0;
+                            // No RTO verdict can outlive its episode.
+                            rto_pending_ = false;
+                            rto_retx_end_ = 0;
+                            retrans_stamp_ts_ = 0;
                         }
+                    } else if (3 == cc_.ca_state) {
+                        // Kernel part D, case TCP_CA_Recovery (tcp_input.c:
+                        // 3012-3018): tcp_try_undo_recovery runs first
+                        // (tcp_input.c:2551-2577) - may_undo restores the
+                        // window and sets the state to Open - and only then
+                        // does tcp_end_cwnd_reduction fire, so the
+                        // COMPLETE_CWR event observes CA_Open.
+                        //
+                        // Reno holds the episode at exactly high_seq
+                        // (tcp_is_non_sack_preventing_reopen, tcp_input.c:
+                        // 2535-2548): reopening there lets the very next
+                        // dup-ACK start a false fast retransmit (RFC 2582).
+                        // The undo still runs on that ACK - only the episode
+                        // end (state change + end_cwnd_reduction) is skipped.
+                        const bool hold_reno = (snd_una_ == high_seq_) && !sack_ok_;
+                        if (fast_recovery_) {
+                            // Linux tcp_try_undo_recovery: tcp_may_undo()
+                            // decides between "restore the pre-cut window" and
+                            // "the reduction stands".
+                            if (TcpMayUndo(opts)) {
+                                if (NULLPTR != cc_ops_ && NULLPTR != cc_ops_->undo_cwnd &&
+                                    0 != prior_cwnd_) {
+                                    cc_.snd_cwnd = cc_ops_->undo_cwnd(&cc_);
+                                } else {
+                                    cc_.snd_cwnd = prior_cwnd_;
+                                }
+                                if (prior_ssthresh_ > cc_.snd_ssthresh) {
+                                    cc_.snd_ssthresh = prior_ssthresh_;
+                                }
+                                undo_marker_ = false;
+                                episode_undone_ = true;  // kernel tcp_undo_cwnd_reduction
+                            }
+                            if (!hold_reno) {
+                                fast_recovery_ = false;
+                                sack_retx_next_ = 0;
+                                undo_retrans_ = -1;
+                            }
+                        }
+                        if (!hold_reno) {
+                            // Kernel tcp_try_undo_recovery -> tcp_set_ca_state
+                            // (TCP_CA_Open) at tcp_input.c:2574, i.e. BEFORE
+                            // tcp_end_cwnd_reduction at :3017.
+                            SetCaState(0);
+                            EndCwndReduction();
+                            high_seq_ = 0;
+                            // No RTO verdict can outlive its episode.
+                            rto_pending_ = false;
+                            rto_retx_end_ = 0;
+                            retrans_stamp_ts_ = 0;
+                        }
+                        // hold_reno: tcp_is_non_sack_preventing_reopen keeps the
+                        // state, fast_recovery_, high_seq_ and the reduction
+                        // bookkeeping. The undo above already ran (and cleared
+                        // its candidate); when there was nothing to undo the
+                        // candidate is left alone - a later DSACK may still
+                        // undo (kernel does not clear undo_marker here either).
+                    } else if (4 == cc_.ca_state) {
+                        // Kernel tcp_process_loss ends with
+                        //   tcp_try_undo_recovery(sk);
+                        //   return;                              (tcp_input.c:2881-2885)
+                        // i.e. NO tcp_end_cwnd_reduction: neither a
+                        // `cwnd = ssthresh` collapse nor CA_EVENT_COMPLETE_CWR.
                         fast_recovery_ = false;
                         sack_retx_next_ = 0;
+                        undo_retrans_ = -1;
+                        SetCaState(0);
+                        high_seq_ = 0;
+                        // No RTO verdict can outlive its episode.
+                        rto_pending_ = false;
+                        rto_retx_end_ = 0;
+                        retrans_stamp_ts_ = 0;
+                    } else {
+                        // Already Open (or Disorder): the episode marker is
+                        // stale - drop it without touching the window.
+                        high_seq_ = 0;
+                        // No RTO verdict can outlive its episode.
+                        rto_pending_ = false;
+                        rto_retx_end_ = 0;
+                        retrans_stamp_ts_ = 0;
                     }
-                    if (4 == cc_.ca_state || 3 == cc_.ca_state) {
-                        SetCaState(0);   // kernel tcp_set_ca_state(TCP_CA_Open)
-                    }
-                    high_seq_ = 0;
-                }
-                if (0 < pending_send_.size()) {
-                    FlushPendingSend(now);  // buffered sends ride the freed window
                 }
                 // RFC 5681 window growth on the ACK clock.
                 if (NULLPTR != cc_ops_) {
@@ -3063,15 +3507,39 @@ namespace xtcp {
                         }
                     }
                 }
-                if (fast_recovery_) {
-                    // RFC 6937 PRR: the cwnd tracks the delivered/out balance
-                    // so the send rate stays proportional to the recovery
-                    // progress (fast recoveries complete fast, slow ones stay
-                    // bounded) - replacing the fixed ssthresh+3 inflation.
-                    prr_delivered_ += acked;
-                    const Int64 prr = static_cast<Int64>(cc_.snd_ssthresh) +
-                        static_cast<Int64>(prr_delivered_) - static_cast<Int64>(prr_out_);
-                    cc_.snd_cwnd = (prr < 1) ? 1 : static_cast<UInt32>(prr);
+                // RFC 6937 PRR (proportional rate reduction): the cwnd tracks
+                // the delivered/out balance so the send rate stays proportional
+                // to the recovery progress (fast recoveries complete fast, slow
+                // ones stay bounded) - replacing the fixed ssthresh+3 inflation.
+                //
+                // Kernel tcp_cong_control (tcp_input.c:3513-3531) returns EARLY
+                // for a cong_control algorithm:
+                //   if (icsk_ca_ops->cong_control) { cong_control(sk, rs); return; }
+                //   if (tcp_in_cwnd_reduction(sk)) tcp_cwnd_reduction(...);
+                // i.e. KCC/BBR own cwnd during recovery; the FSM must not
+                // overwrite it (audit D08).
+                //
+                // Kernel tcp_cwnd_reduction (tcp_input.c:2643-2667) is entirely
+                // in PACKETS: sndcnt/delta/prior_cwnd/prr_delivered/prr_out.
+                // The port used to add `acked` (BYTES) to a packet-domain
+                // ssthresh, so a 2*MSS partial ACK produced cwnd = 2923
+                // (audit D08).
+                if (fast_recovery_ && (NULLPTR == cc_ops_ || NULLPTR == cc_ops_->cong_control)) {
+                    prr_delivered_ += PktCount(acked, peer_mss_);
+                    // Kernel TCP_INFINITE_SSTHRESH guard (same sentinel test as
+                    // tcp_end_cwnd_reduction, tcp_input.c:2677): the sentinel
+                    // means "no reduction was ever recorded", so it is NOT a
+                    // window. The kernel's delta >= 0 branch computes
+                    // cwnd = packets_in_flight + sndcnt and never uses the
+                    // sentinel as an anchor; the port's simplified
+                    // `ssthresh + delivered - out` would, which is how a held
+                    // Reno episode ended at 0x7FFFFFFF (a4rev41/a4rev43[1]).
+                    // Keep the window the caller (undo / CC) set instead.
+                    if (cc_.snd_ssthresh < 0x7FFFFFFFu) {
+                        const Int64 prr = static_cast<Int64>(cc_.snd_ssthresh) +
+                            static_cast<Int64>(prr_delivered_) - static_cast<Int64>(prr_out_);
+                        cc_.snd_cwnd = (prr < 1) ? 1 : static_cast<UInt32>(prr);
+                    }
                     // RFC 6675 partial-ACK: stay in fast recovery while
                     // SACK-implied gaps remain after the cumulative ACK, so
                     // each newly recovered segment's ACK (a dupack for the
@@ -3115,24 +3583,63 @@ namespace xtcp {
                         }
                     }
                     if (!gaps_remain) {
-                        // Linux tcp_try_undo_recovery: a no-SACK fast-recovery
-                        // entry (no confirmed-loss signal) whose recovery
-                        // completes cleanly restores the pre-cut window -
-                        // replacing the exit convention cwnd=ssthresh.
-                        if (undo_marker_) {
-                            cc_.snd_cwnd = prior_cwnd_;
-                            cc_.snd_ssthresh = prior_ssthresh_;
-                            undo_marker_ = false;
+                        // Kernel tcp_is_non_sack_preventing_reopen
+                        // (tcp_input.c:2535-2548) / tcp_try_undo_recovery
+                        // (tcp_input.c:2551-2577): the undo runs FIRST, and
+                        // only then does a NON-SACK recovery at exactly
+                        // high_seq stay open (reopening there lets the very
+                        // next dup-ACK start a false fast retransmit,
+                        // RFC 2582). tcp_fastretrans_alert then returns out of
+                        // part D (tcp_input.c:3015-3016), so the episode is NOT
+                        // closed on this ACK and no COMPLETE_CWR fires.
+                        //
+                        // tcp_cong_control still runs afterwards
+                        // (tcp_input.c:3939) and, because the state is still
+                        // Recovery, takes tcp_cwnd_reduction (tcp_input.c:3523)
+                        // - i.e. PRR keeps running on this very ACK.
+                        const bool hold_reno =
+                            (snd_una_ == high_seq_) && !sack_ok_;
+                        if (hold_reno) {
+                            // tcp_is_non_sack_preventing_reopen keeps the
+                            // state, fast_recovery_, high_seq_ and the
+                            // reduction bookkeeping. Part D above already ran
+                            // the undo (tcp_try_undo_recovery) and left the
+                            // candidate alone when there was nothing to undo -
+                            // a later DSACK may still undo (the kernel does not
+                            // clear undo_marker on this path either).
                         } else {
-                            cc_.snd_cwnd = cc_.snd_ssthresh;
+                            // Linux tcp_try_undo_recovery: tcp_may_undo()
+                            // decides between "restore the pre-cut window" and
+                            // "the reduction stands at ssthresh".
+                            if (TcpMayUndo(opts)) {
+                                if (NULLPTR != cc_ops_ && NULLPTR != cc_ops_->undo_cwnd &&
+                                    0 != prior_cwnd_) {
+                                    cc_.snd_cwnd = cc_ops_->undo_cwnd(&cc_);
+                                } else {
+                                    cc_.snd_cwnd = prior_cwnd_;
+                                }
+                                if (prior_ssthresh_ > cc_.snd_ssthresh) {
+                                    cc_.snd_ssthresh = prior_ssthresh_;
+                                }
+                                undo_marker_ = false;
+                                episode_undone_ = true;  // kernel tcp_undo_cwnd_reduction
+                            }
+                            fast_recovery_ = false;
+                            sack_retx_next_ = 0;
+                            undo_retrans_ = -1;
+                            // The recovery ends here: the CA state must follow
+                            // (kernel tcp_try_undo_recovery -> tcp_set_ca_state
+                            // (TCP_CA_Open) at tcp_input.c:2574), and only
+                            // then does tcp_end_cwnd_reduction run (:3017) -
+                            // so the COMPLETE_CWR event observes CA_Open.
+                            SetCaState(0);
+                            EndCwndReduction();
+                            high_seq_ = 0;
+                            // No RTO verdict can outlive its episode.
+                            rto_pending_ = false;
+                            rto_retx_end_ = 0;
+                            retrans_stamp_ts_ = 0;
                         }
-                        fast_recovery_ = false;
-                        sack_retx_next_ = 0;
-                        // The recovery ends here: the CA state must follow
-                        // (kernel tcp_try_undo_recovery -> tcp_set_ca_state
-                        // (TCP_CA_Open)); leaving it at Recovery makes a
-                        // state-keying CC re-cut the window on every ACK.
-                        SetCaState(0);
                     } else {
                         // Real gaps remain: the loss signal is confirmed, so a
                         // no-SACK entry may not undo.
@@ -3152,12 +3659,33 @@ namespace xtcp {
                         // cumulative-ACK advance duplicates live segments (a
                         // per-ACK re-send storm). Deflate cwnd (Reno) and let
                         // dupacks + the RTO backstop drive the retransmits.
+                        //
+                        // [retained deviation] This deflation has no direct
+                        // kernel counterpart: the kernel leaves cwnd to
+                        // tcp_cwnd_reduction (PRR) for the whole recovery. The
+                        // port keeps it because the Reno no-SACK path has no
+                        // SACK scoreboard to drive PRR's delivered/out balance;
+                        // removing it re-introduces the per-ACK retransmit
+                        // storm documented above. Only the classic (non-plugin)
+                        // path reaches here - a plugin CC with cong_control
+                        // never enters this block (guard above).
                         if (NULLPTR == opts || 0 == opts->sack_count) {
                             cc_.snd_cwnd = cc_.snd_ssthresh;
                         } else {
                             RetransmitEarliestMissing(now, opts);
                         }
                     }
+                }
+                // Kernel send order (tcp_input.c:3938-3940):
+                //   tcp_rate_gen -> tcp_cong_control -> tcp_xmit_recovery
+                // i.e. the CC has already had its say about cwnd when new data
+                // leaves. The flush therefore runs AFTER the CC hook and after
+                // the PRR block above - never before them. (Before dfe0b55 the
+                // exit block did not raise cwnd, so the old position was
+                // harmless; with the exit block in place it released the whole
+                // backlog at 0x7FFFFFFF - audit D01.)
+                if (0 < pending_send_.size()) {
+                    FlushPendingSend(now);  // buffered sends ride the freed window
                 }
             } else {
                 // Duplicate ACK on the frontier (ack == snd_una_). It may still carry a window
@@ -3281,8 +3809,9 @@ namespace xtcp {
                     // balance instead of a fixed ssthresh+3 inflation, so the
                     // send rate stays proportional to the recovery progress
                     // (fast recoveries complete fast, slow ones stay bounded).
-                    // RecoverFS anchors the delivered/out accounting.
-                    recover_fs_ = snd_nxt_ - snd_una_;
+                    // RecoverFS anchors the delivered/out accounting. PACKETS
+                    // (kernel tp->recover_fs = tcp_packets_in_flight).
+                    recover_fs_ = PktCount(snd_nxt_ - snd_una_, peer_mss_);
                     prr_delivered_ = 0;
                     prr_out_ = 0;
                     // RFC 5681 ssthresh+3 inflation is CLASSIC RENO ONLY.
@@ -3419,7 +3948,7 @@ namespace xtcp {
         }
 
         UInt32 TcpConn::PipeBytes() const noexcept {
-            // RFC 6675 搂4: pipe = (HighData - HighACK) - SACKed + Retransmitted.
+            // RFC 6675 闂?: pipe = (HighData - HighACK) - SACKed + Retransmitted.
             // SACKed bytes sit in the receiver's buffer (not the network) and
             // retransmitted-but-unacked bytes occupy the pipe twice, so the
             // pipe is the true in-network occupancy - the cwnd (inflated to
@@ -3593,10 +4122,11 @@ namespace xtcp {
             // (tcp_output_v66.c:167-168), evaluated at the emit point.
             const bool pipe_empty = (0 == PipeInFlightBytes());
             snd_nxt_ += len;
-            // RFC 6937 PRR: bytes sent during the recovery count against the
-            // proportional cwnd (delivered - out balance).
+            // RFC 6937 PRR: packets sent during the recovery count against the
+            // proportional cwnd (delivered - out balance). PACKET domain: the
+            // kernel's prr_out is incremented by tcp_skb_pcount, not by bytes.
             if (fast_recovery_) {
-                prr_out_ += len;
+                prr_out_ += PktCount(len, peer_mss_);
             }
             SentSeg seg;
             seg.seq = seq;
@@ -3778,6 +4308,9 @@ namespace xtcp {
                             if (sink_) {
                                 sink_(std::move(packet));
                             }
+                            // Kernel tcp_retransmit_skb (tcp_output_66.c:3325):
+                            // tp->total_retrans += tcp_skb_pcount(skb).
+                            total_retrans_pkts_ += front.pkt_count;
                         }
                         // The probe drained the last buffered byte while a
                         // deferred FIN (Close with buffered data) is pending:
@@ -3895,6 +4428,14 @@ namespace xtcp {
                         tail.pkt_count = PktCount(tail.len, peer_mss_);
                         tail.app_limited = (0 != cc_.app_limited) ? 1 : 0;
                         tail.is_retrans = 1;
+                        // Kernel tcp_send_loss_probe -> tcp_retransmit_skb:
+                        // tp->total_retrans += tcp_skb_pcount(skb).
+                        // MUST run BEFORE sink_: a synchronous backend delivers
+                        // the peer's ACK reentrantly inside sink_(), which can
+                        // pop (and free) this tail segment - reading
+                        // tail.pkt_count afterwards is a heap use-after-free
+                        // (ASan: test_tso_rto, tcp_fsm.cpp:4438).
+                        total_retrans_pkts_ += tail.pkt_count;
                         // Kernel tcp_event_data_sent: every data skb counts,
                         // retransmissions included (the TLP is one).
                         NotifyTxStart(0 == PipeInFlightBytes());
@@ -4109,6 +4650,11 @@ namespace xtcp {
                 // Kernel CA_EVENT_TX_START gate: tcp_packets_in_flight == 0
             // (tcp_output_v66.c:167-168), evaluated at the emit point.
             const bool pipe_empty = (0 == PipeInFlightBytes());
+                // RFC 6937 PRR: the ACK-driven flush also spends recovery
+                // credit. PACKET domain (kernel prr_out += tcp_skb_pcount).
+                if (fast_recovery_) {
+                    prr_out_ += PktCount(n, peer_mss_);
+                }
                 snd_nxt_ += n;
                 SentSeg seg;
                 seg.seq = seq;
@@ -4176,6 +4722,14 @@ namespace xtcp {
         }
 
         TcpConn::ConnCheckpoint TcpConn::MakeCheckpoint() const noexcept {
+            // Migration runs on a DIFFERENT thread than the data path
+            // (scheduler Checkpoint/Restore), and it copies the retransmission
+            // queue (BufRef::Clone -> pool allocation) while ApplyCheckpoint
+            // may now re-init a CC plugin (KccInit -> new KccState + entropy).
+            // Both are unsynchronized against OnSegment/SendData unless the
+            // connection lock is taken here (audit E, batch 5). syncobj_ is
+            // mutable, so the const method can lock it.
+            std::lock_guard<std::recursive_mutex> scope(syncobj_);
             ConnCheckpoint ckpt;
             ckpt.state = state_;
             ckpt.snd_una = snd_una_;
@@ -4215,6 +4769,11 @@ namespace xtcp {
         }
 
         void TcpConn::ApplyCheckpoint(const ConnCheckpoint& ckpt) noexcept {
+            // Symmetric with MakeCheckpoint: the restore rewrites every send
+            // scalar, clones the checkpoint's segments and may re-init the CC
+            // plugin (heap allocation + entropy seed), so it must hold the
+            // connection lock against the data path (audit E, batch 5).
+            std::lock_guard<std::recursive_mutex> scope(syncobj_);
             state_ = ckpt.state;
             snd_una_ = ckpt.snd_una;
             snd_nxt_ = ckpt.snd_nxt;
@@ -4243,6 +4802,64 @@ namespace xtcp {
             batch_prior_delivered_pkts_ = 0;
             lost_out_pkts_ = 0;
             retrans_out_pkts_ = 0;
+            // Kernel tp->total_retrans / tp->dsack_dups / tp->max_window are
+            // per-connection counters; a migrated flow restarts from the fresh
+            // values (the checkpoint carries no retransmission history).
+            total_retrans_pkts_ = 0;
+            dsack_dups_ = 0;
+            max_window_ = (0 < snd_wnd_) ? snd_wnd_ : kDefaultWindow;
+            // The checkpoint carries no congestion state, so every episode /
+            // undo field must be reset to its "no episode" value. Otherwise
+            // the TARGET connection's previous values leak into the migrated
+            // one: a stale rto_pending_ would keep the DSACK/Eifel gate
+            // closed, a stale undo_retrans_ would feed batch 2's may-undo
+            // gate, and a stale ca_state would make EndCwndReduction's
+            // `2 == ca_state` guard fire on a connection that is not in CWR.
+            // Batch 5 (D10) owns the complete congestion-view reset; this is
+            // the batch-1 subset it builds on.
+            fast_recovery_ = false;
+            sack_retx_next_ = 0;
+            high_seq_ = 0;
+            prior_cwnd_ = 0;
+            prior_ssthresh_ = 0;
+            undo_marker_ = false;
+            undo_retrans_ = -1;
+            episode_undone_ = true;
+            rto_pending_ = false;
+            rto_ts_val_ = 0;
+            retrans_stamp_ts_ = 0;
+            rto_retx_end_ = 0;
+            cc_.ca_state = 0;
+            cc_.prior_cwnd = 0;
+            cc_.prior_ssthresh = 0;
+            cc_.packet_conservation = 0;
+            // Batch 5 (D10): the checkpoint carries NO congestion-control
+            // view, so the migrated flow must restart from the "fresh
+            // connection, Open state" values the TcpConn constructor uses
+            // (tcp_fsm.cpp:896-903) instead of inheriting the destination's
+            // Loss/Recovery window it cannot justify. Leaving snd_cwnd /
+            // snd_ssthresh / prr_* / recover_fs_ / dup_acks_ in place let a
+            // stale episode survive the restore and rewrite the migrated
+            // window (audit D10, observed: cwnd stayed at the target's cut
+            // value after ApplyCheckpoint).
+            cc_.snd_cwnd = 10;                 // RFC 6928 initcwnd
+            cc_.snd_ssthresh = 0x7FFFFFFF;     // unlimited until the first loss
+            cc_.snd_cwnd_cnt = 0;
+            cc_.pacing_rate = 0;
+            recover_fs_ = 0;
+            prr_delivered_ = 0;
+            prr_out_ = 0;
+            dup_acks_ = 0;
+            fast_retransmit_seq_ = 0;
+            pacing_deadline_ = 0;
+            if (NULLPTR != cc_ops_ && NULLPTR != cc_ops_->init) {
+                // Fresh plugin epoch. KCC's init resets prev_ca_state /
+                // packet_conservation / full_bw (cc_kcc.cpp:770-789); CUBIC's
+                // resets the epoch base; BBR's resets its cycle. Without this
+                // a migrated KCC flow keeps packet_conservation=1 from the
+                // source shard and never grows.
+                cc_ops_->init(&cc_);
+            }
             batch_app_limited_ = 0;
             batch_retrans_ = false;
             last_ack_delayed_ = false;
@@ -4295,7 +4912,7 @@ namespace xtcp {
         }
 
         void TcpConn::SendChallengeAck() noexcept {
-            // RFC 5961 搂5 / Linux tcp_challenge_ack_limit: a spoofed flood of
+            // RFC 5961 闂? / Linux tcp_challenge_ack_limit: a spoofed flood of
             // out-of-window RSTs must NOT reflect 1:1 into challenge ACKs.
             // Allow up to kChallengeAckLimit per 1s window; excess challenges
             // are dropped silently (the connection is simply not closed).
@@ -4760,6 +5377,11 @@ namespace xtcp {
                         SetPeerMss(536);
                     }
                     snd_wnd_ = static_cast<UInt32>(hdr.window) << snd_wscale_;
+                    // Kernel tcp_rcv_synsent (tcp_input_66.c:6409):
+                    //   tp->max_window = tp->snd_wnd;
+                    // an ASSIGNMENT at the handshake (later updates only grow
+                    // it, tcp_input_66.c:3596-3597).
+                    max_window_ = snd_wnd_;
                     snd_wl1_ = hdr.ack;  // RFC 793: window update anchor
                     snd_wl2_ = hdr.seq;
                     cc_.snd_wnd = snd_wnd_;
@@ -4827,12 +5449,25 @@ namespace xtcp {
                                     // Kernel TCPCB_SACKED_RETRANS accounting:
                                     // the requeued early data is retransmitted.
                                     retrans_out_pkts_ += retrans_queue_.front().pkt_count;
+                                    // Kernel tcp_output_66.c:3390-3392: this
+                                    // re-send is a real retransmission, so it
+                                    // increments undo_retrans too.
+                                    if (undo_retrans_ < 0) {
+                                        undo_retrans_ = 0;
+                                    }
+                                    undo_retrans_ += static_cast<Int32>(
+                                        retrans_queue_.front().pkt_count);
                                     sink_(retrans_queue_.front().data.Clone());  // retransmit now
                                     // This re-send IS a data retransmission
                                     // (the early bytes were already sent in the
                                     // SYN): count it, mirroring RetransmitFront
                                     // and RetransmitEarliestMissing.
                                     ++retransmit_count_;
+                                    // Kernel tcp_retransmit_skb
+                                    // (tcp_output_66.c:3325): tp->total_retrans
+                                    // += tcp_skb_pcount(skb).
+                                    total_retrans_pkts_ +=
+                                        retrans_queue_.front().pkt_count;
                                 } else {
                                     retrans_queue_.push_front(std::move(seg));
                                 }
@@ -4907,6 +5542,8 @@ namespace xtcp {
                 }
                 if (hdr.IsAck() && hdr.ack == snd_nxt_) {
                     snd_wnd_ = static_cast<UInt32>(hdr.window) << snd_wscale_;
+                    // Kernel tcp_rcv_synsent: tp->max_window = tp->snd_wnd.
+                    max_window_ = snd_wnd_;
                     snd_wl1_ = hdr.ack;
                     snd_wl2_ = hdr.seq;
                     cc_.snd_wnd = snd_wnd_;
@@ -5046,6 +5683,7 @@ namespace xtcp {
                         (SeqLt(snd_wl1_, hdr.ack) ||
                          (snd_wl1_ == hdr.ack && !SeqLt(hdr.seq, snd_wl2_)))) {
                         snd_wnd_ = static_cast<UInt32>(hdr.window) << snd_wscale_;
+                        if (snd_wnd_ > max_window_) { max_window_ = snd_wnd_; }
                         snd_wl1_ = hdr.ack;
                         snd_wl2_ = hdr.seq;
                         cc_.snd_wnd = snd_wnd_;
@@ -5381,6 +6019,7 @@ namespace xtcp {
                         (SeqLt(snd_wl1_, hdr.ack) ||
                          (snd_wl1_ == hdr.ack && !SeqLt(hdr.seq, snd_wl2_)))) {
                         snd_wnd_ = static_cast<UInt32>(hdr.window) << snd_wscale_;
+                        if (snd_wnd_ > max_window_) { max_window_ = snd_wnd_; }
                         snd_wl1_ = hdr.ack;
                         snd_wl2_ = hdr.seq;
                         cc_.snd_wnd = snd_wnd_;
@@ -5465,6 +6104,7 @@ namespace xtcp {
                         (SeqLt(snd_wl1_, hdr.ack) ||
                          (snd_wl1_ == hdr.ack && !SeqLt(hdr.seq, snd_wl2_)))) {
                         snd_wnd_ = static_cast<UInt32>(hdr.window) << snd_wscale_;
+                        if (snd_wnd_ > max_window_) { max_window_ = snd_wnd_; }
                         snd_wl1_ = hdr.ack;
                         snd_wl2_ = hdr.seq;
                         cc_.snd_wnd = snd_wnd_;
@@ -5541,6 +6181,7 @@ namespace xtcp {
                         (SeqLt(snd_wl1_, hdr.ack) ||
                          (snd_wl1_ == hdr.ack && !SeqLt(hdr.seq, snd_wl2_)))) {
                         snd_wnd_ = static_cast<UInt32>(hdr.window) << snd_wscale_;
+                        if (snd_wnd_ > max_window_) { max_window_ = snd_wnd_; }
                         snd_wl1_ = hdr.ack;
                         snd_wl2_ = hdr.seq;
                         cc_.snd_wnd = snd_wnd_;

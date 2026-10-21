@@ -64,8 +64,287 @@ static void ConnCwnd(xtcp::XtcpStack& s, UInt64 id, UInt32& cwnd) {
                 dup_acks, fast_rec, front_seq, snd_una, lp, rp);
 }
 
+// ---- FSM-level ECN tests (batch 1: D02/D13) ----
+static constexpr UInt32 kMss = 1460;
+
+static void Put32(Byte* p, UInt32 v) {
+    p[0] = static_cast<Byte>(v >> 24);
+    p[1] = static_cast<Byte>(v >> 16);
+    p[2] = static_cast<Byte>(v >> 8);
+    p[3] = static_cast<Byte>(v & 0xFF);
+}
+
+/** Raw IPv4-less TCP segment (TcpConn::OnSegment takes the TCP payload). */
+static std::vector<Byte> Seg(UInt32 seq, UInt32 ack, UInt16 flags, bool sack = false,
+                             UInt32 sl = 0, UInt32 sr = 0, bool mss_opt = false) {
+    const UInt32 opt = (sack ? 12u : 0u) + (mss_opt ? 4u : 0u);
+    std::vector<Byte> seg(20 + opt, 0);
+    Byte* t = seg.data();
+    t[0] = 0x9C; t[1] = 0x40;   // sport 40000
+    t[2] = 0x01; t[3] = 0xBB;   // dport 443
+    Put32(t + 4, seq);
+    Put32(t + 8, ack);
+    t[12] = static_cast<Byte>(((20 + opt) / 4) << 4);
+    t[13] = static_cast<Byte>(flags);
+    t[14] = 0xFF; t[15] = 0xFF;
+    UInt32 o = 20;
+    if (mss_opt) {
+        t[o] = 2; t[o + 1] = 4;
+        t[o + 2] = static_cast<Byte>(kMss >> 8); t[o + 3] = static_cast<Byte>(kMss & 0xFF);
+        o += 4;
+    }
+    if (sack) {
+        t[o] = 5; t[o + 1] = 10;
+        Put32(t + o + 2, sl);
+        Put32(t + o + 6, sr);
+        t[o + 10] = 1; t[o + 11] = 1;
+    }
+    return seg;
+}
+
+static xtcp::core::Endpoint EcnLocalEp() {
+    xtcp::core::Endpoint e;
+    e.family = 4;
+    e.addr[0] = 0x0A000001;
+    e.port = 443;
+    return e;
+}
+
+static xtcp::core::Endpoint EcnRemoteEp() {
+    xtcp::core::Endpoint e;
+    e.family = 4;
+    e.addr[0] = 0xC0A80102;
+    e.port = 40000;
+    return e;
+}
+
+/** Established ECN connection (real SYN / SYN+ACK|ECE handshake). */
+struct EcnHarness {
+    std::vector<xtcp::buf::BufRef> tx;
+    xtcp::core::TcpConn conn;
+    xtcp::core::TimePoint now = 1000;
+
+    EcnHarness()
+        : conn(xtcp::core::TcpState::kSynSent, EcnLocalEp(), EcnRemoteEp(), 100, 200,
+               [this](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); }) {
+        conn.SetEcnRequested(true);
+        conn.SetSackOk(true);
+        conn.SendSyn();
+        const std::vector<Byte> synack = Seg(500, 101,
+            static_cast<UInt16>(xtcp::core::kFlagSyn | xtcp::core::kFlagAck |
+                                xtcp::core::kFlagEce), false, 0, 0, true);
+        conn.OnSegment(synack.data(), static_cast<UInt32>(synack.size()), now);
+        conn.SetSndBuf(4u << 20);
+    }
+
+    void Send(UInt32 n) {
+        std::vector<Byte> buf(n, 0x41);
+        CHECK(conn.SendData(buf.data(), n, now));
+    }
+    void Deliver(UInt32 ack, UInt16 flags = xtcp::core::kFlagAck, bool sack = false,
+                 UInt32 sl = 0, UInt32 sr = 0) {
+        const std::vector<Byte> seg = Seg(201, ack, flags, sack, sl, sr);
+        conn.OnSegment(seg.data(), static_cast<UInt32>(seg.size()), now);
+    }
+    void Warmup(UInt32 rounds) {
+        for (UInt32 r = 0; r < rounds; ++r) {
+            const UInt32 w = conn.Cwnd();
+            Send(w * kMss);
+            now += 20000;
+            Deliver(conn.SndNxt());
+        }
+    }
+};
+
+static Byte g_ecnState = 0xFF;
+static UInt32 g_ecnCalls = 0;
+
+static void EcnProbeSsthreshInit(xtcp::cc::XtcpConnCc*) {}
+static void EcnProbeSsthreshRelease(xtcp::cc::XtcpConnCc*) {}
+static UInt32 EcnProbeSsthresh(xtcp::cc::XtcpConnCc* sk) { return sk->snd_ssthresh; }
+static void EcnProbeControl(xtcp::cc::XtcpConnCc* sk, const xtcp::cc::RateSample*) {
+    g_ecnState = sk->ca_state;
+    ++g_ecnCalls;
+}
+
+static void EnsureEcnProbeCc() {
+    static bool registered = false;
+    if (registered) {
+        return;
+    }
+    xtcp::cc::XtcpCongestionOps ops;
+    ops.name = "ecn_cc_probe";
+    ops.init = EcnProbeSsthreshInit;
+    ops.release = EcnProbeSsthreshRelease;
+    ops.ssthresh = EcnProbeSsthresh;
+    ops.cong_control = EcnProbeControl;
+    CHECK(xtcp::cc::RegisterCongestionControl(ops));
+    registered = true;
+}
+
+/**
+ * @brief D02: an ECE must enter CA_CWR (kernel tcp_enter_cwr,
+ *        tcp_input.c:2686-2697) BEFORE the CC hook runs.
+ *
+ * Kernel tcp_fastretrans_alert's ECE path (tcp_try_to_open -> tcp_enter_cwr)
+ * sets high_seq/prior_cwnd/prr_*, clears undo_marker and moves the state to
+ * TCP_CA_CWR; tcp_cong_control runs afterwards, so a state-keying CC sees
+ * state 2. The port never called tcp_enter_cwr at all: the ECE cut happened
+ * inline, the state stayed Open and high_seq_ was never anchored (audit D02).
+ */
+static void TestEcnEntersCwr() {
+    EnsureEcnProbeCc();
+    EcnHarness h;
+    CHECK(h.conn.EcnActive());
+    CHECK(h.conn.SetCongestionControl("ecn_cc_probe"));
+    h.Warmup(8);
+    h.Send(kMss);
+    g_ecnState = 0xFF;
+    g_ecnCalls = 0;
+    h.now += 20000;
+    h.Deliver(h.conn.SndNxt(),
+              static_cast<UInt16>(xtcp::core::kFlagAck | xtcp::core::kFlagEce));
+    CHECK(1 <= g_ecnCalls);
+    CHECK(2 == g_ecnState);   // red: 0 (never entered CWR)
+}
+
+/**
+ * @brief D02: the ECE reduction must survive the same ACK.
+ *
+ * KCC's ssthresh hook passes snd_ssthresh through (cc_kcc.cpp:1042) and
+ * cong_control owns the window, so the FSM's clamp to the hook's return
+ * value is the only reduction. Before the fix the ECE block ran with the
+ * sentinel threshold and cwnd never moved (audit D02, a4probe30: 92 -> 92).
+ */
+static void TestEcnCutSurvivesSameAck() {
+    xtcp::cc::RegisterKcc();
+    EcnHarness h;
+    CHECK(h.conn.SetCongestionControl("kcc"));
+    h.Warmup(20);
+    const UInt32 cwnd_before = h.conn.Cwnd();
+    CHECK(20 < cwnd_before);
+    h.Send(kMss);
+    h.now += 20000;
+    h.Deliver(h.conn.SndNxt(),
+              static_cast<UInt16>(xtcp::core::kFlagAck | xtcp::core::kFlagEce));
+    std::fprintf(stderr, "[ecn-cc] kcc ECE: before=%u after=%u\n",
+                 cwnd_before, h.conn.Cwnd());
+    CHECK(h.conn.Cwnd() < cwnd_before);   // red: 92 -> 92
+}
+
+/**
+ * @brief D02: an ECE ACK forbids undoing the cwnd reduction.
+ *
+ * Kernel tcp_fastretrans_alert part A (tcp_input.c:2986-2987) clears
+ * prior_ssthresh on EVERY ECE ACK ("congestion is proven"), and
+ * tcp_enter_cwr clears undo_marker. The port kept the no-SACK undo marker,
+ * so the ECE that completed a recovery restored the pre-loss window and
+ * ssthresh (audit D02, a4probe2/P2: cwnd 5 -> 14, ssthresh 2 -> 0x7FFFFFFF).
+ */
+static void TestEceBlocksRecoveryUndo() {
+    EcnHarness h;   // built-in Reno (no CC plugin)
+    h.Warmup(0);
+    for (UInt32 i = 0; i < 4; ++i) {
+        h.Send(kMss);
+    }
+    const UInt32 una = h.conn.SndUna();
+    const UInt32 end = h.conn.SndNxt();
+    for (UInt32 i = 0; i < 3; ++i) {
+        h.now += 1000;
+        h.Deliver(una);   // raw dup-ACK: no-SACK recovery entry
+    }
+    CHECK(h.conn.FastRecovery());
+    const UInt32 cwnd_cut = h.conn.Cwnd();
+    const UInt32 ssth_cut = h.conn.Ssthresh();
+    h.now += 20000;
+    h.Deliver(end, static_cast<UInt16>(xtcp::core::kFlagAck | xtcp::core::kFlagEce));
+    std::fprintf(stderr, "[ecn-cc] undo gate: cut=%u/%u after=%u/%u\n",
+                 cwnd_cut, ssth_cut, h.conn.Cwnd(), h.conn.Ssthresh());
+    CHECK(h.conn.Cwnd() <= cwnd_cut);        // red: 14
+    CHECK(h.conn.Ssthresh() <= ssth_cut);    // red: 0x7FFFFFFF
+}
+
+/**
+ * @brief D13: a CWR episode ends when an ACK above high_seq arrives.
+ *
+ * Kernel tcp_fastretrans_alert part D, case TCP_CA_CWR (tcp_input.c:3003-3010):
+ * CWR is held at exactly high_seq (the receiver has not seen the CWR bit yet)
+ * and ends as soon as something ABOVE high_seq is ACKed. The port's exit
+ * block only handled Recovery/Loss, so CA_CWR could never end (audit D13).
+ */
+static void TestCwrEpisodeEnds() {
+    EnsureEcnProbeCc();
+    EcnHarness h;
+    CHECK(h.conn.EcnActive());
+    CHECK(h.conn.SetCongestionControl("ecn_cc_probe"));
+    h.Warmup(8);
+    h.Send(kMss);
+    const UInt32 ece_ack = h.conn.SndNxt();
+    g_ecnState = 0xFF;
+    h.now += 20000;
+    h.Deliver(ece_ack,
+              static_cast<UInt16>(xtcp::core::kFlagAck | xtcp::core::kFlagEce));
+    CHECK(2 == g_ecnState);   // CWR entered (T1-3)
+    // An ACK above high_seq: the peer has seen our CWR bit.
+    h.Send(kMss);
+    g_ecnState = 0xFF;
+    h.now += 20000;
+    h.Deliver(h.conn.SndNxt());
+    CHECK(0 == g_ecnState);   // CWR ended (red: stays 2/0 pre-fix, unreachable)
+}
+
+/**
+ * @brief Batch 5 addendum (B): a RACK verdict must not recut the window
+ *        during CA_CWR.
+ *
+ * Kernel tcp_enter_recovery is guarded by `!tcp_in_cwnd_reduction(sk)`
+ * (tcp_input_66.c:2834-2839) and tcp_in_cwnd_reduction is true for BOTH
+ * TCP_CA_CWR and TCP_CA_Recovery (tcp_66.h:1245-1249): during CWR the
+ * reduction snapshot (prior_cwnd_/prior_ssthresh_/high_seq_) already exists,
+ * so tcp_init_cwnd_reduction must not run again. The port's RACK gate only
+ * excluded CA_Loss (4), letting state 2 through and halving ssthresh a
+ * second time (audit B).
+ *
+ * Red baseline: fr=1 and ssthresh 5 -> 2.
+ */
+static void TestRackDoesNotRecutInCwr() {
+    EcnHarness h;   // built-in Reno: ssthresh is the observable
+    h.Warmup(8);
+    // Six segments in flight (one ACK-clock round's worth).
+    for (UInt32 i = 0; i < 6; ++i) {
+        h.Send(kMss);
+    }
+    const UInt32 una = h.conn.SndUna();
+    // ECE dup-ACK on the frontier: tcp_enter_cwr -> CA_CWR (2).
+    h.now += 20000;
+    h.Deliver(una, static_cast<UInt16>(xtcp::core::kFlagAck | xtcp::core::kFlagEce));
+    const UInt32 ssth_cwr = h.conn.Ssthresh();
+    std::fprintf(stderr,
+                 "[B] after CWR: una=%u nxt=%u q=%u cwnd=%u ssth=%u\n",
+                 una, h.conn.SndNxt(), h.conn.RetransQueueSize(),
+                 h.conn.Cwnd(), ssth_cwr);
+    CHECK(2 <= h.conn.RetransQueueSize());
+
+    // ONE dup-ACK whose SACK block sets the RACK anchor (segment 2 end) and
+    // leaves segment 1 overdue: a pure RACK verdict. dup_acks_ stays 2, below
+    // the classic 3-dup threshold, so the classic entry cannot mask it.
+    h.now += 500000;
+    h.Deliver(una, xtcp::core::kFlagAck, true, una + kMss, una + 2 * kMss);
+
+    std::fprintf(stderr,
+                 "[B] cwr ssth=%u -> after RACK ssth=%u fr=%d dup=%u\n",
+                 ssth_cwr, h.conn.Ssthresh(), h.conn.FastRecovery() ? 1 : 0,
+                 h.conn.DupAcks());
+    CHECK(!h.conn.FastRecovery());            // red: RACK entered Recovery
+    CHECK(ssth_cwr == h.conn.Ssthresh());     // red: cut again to 2
+}
 int main() {
     xtcp::buf::InitPools();
+    TestEcnEntersCwr();
+    TestEcnCutSurvivesSameAck();
+    TestEceBlocksRecoveryUndo();
+    TestCwrEpisodeEnds();
+    TestRackDoesNotRecutInCwr();
     {
         // (1) Plugin level: CUBIC's ECN response cuts by beta 0.7. FSM
         // contract (ECN withdraw): ssthresh hook (updates the CUBIC epoch

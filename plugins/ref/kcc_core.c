@@ -379,7 +379,8 @@ static void kcc_geodesic_update(struct kcc_core *k, s64 rtt_us, int round_start)
 									   ? 0xFFFFFFFFu
 									   : (u32)(abs_innov >> KCC_SCALE_SHIFT));
 			k->jitter_ewma = (k->sample_cnt > 1)
-								 ? ((k->jitter_ewma * KCC_EWMA_JITTER_NUM + raw_jitter) / KCC_EWMA_JITTER_DEN)
+								 ? (u32)(((u64)k->jitter_ewma * KCC_EWMA_JITTER_NUM +
+										  (u64)raw_jitter) / KCC_EWMA_JITTER_DEN)
 								 : raw_jitter;
 			u32 jitter_cap = (k->min_rtt_us != MIN_RTT_UNINIT)
 								 ? kcc_max_u32(k->min_rtt_us, KCC_RTT_SAMPLE_MAX_US)
@@ -714,6 +715,7 @@ static void kcc_update_model(struct kcc_core *k, const struct kcc_ack_input *in)
 	if (round_start) {
 		k->next_rtt_delivered = in->delivered_total_pkts;
 		k->rtt_cnt++;
+		k->packet_conservation = 0;
 		k->prev_round_rtt_min = k->round_rtt_min;
 		k->round_rtt_min = MIN_RTT_UNINIT;
 	}
@@ -796,7 +798,8 @@ static void kcc_set_pacing_rate(struct kcc_core *k, u64 bw, s32 gain) {
 	 * with bw * mss (kcc_rate_bytes_per_sec). */
 	if (bw > (u64)KCC_BW_SEG_MAX) bw = (u64)KCC_BW_SEG_MAX;
 	rate = kcc_haircut_scale(kcc_mul_shr8(bw * mss, (u32)gain));
-	if (!k->has_seen_rtt && k->min_rtt_us > 0 && k->min_rtt_us != MIN_RTT_UNINIT) {
+	if (!k->has_seen_rtt && k->min_rtt_us > 0 && k->min_rtt_us != MIN_RTT_UNINIT &&
+	    k->mss > 0) {
 		u64 rtt;
 		u64 cwnd_segs;
 		u64 bdp_bw;

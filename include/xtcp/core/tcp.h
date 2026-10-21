@@ -504,6 +504,40 @@ namespace xtcp {
                 return retransmit_count_;
             }
             /**
+             * @brief Kernel tp->total_retrans (PACKETS): retransmissions
+             *        counted by tcp_skb_pcount, the domain the DSACK
+             *        credibility gate compares against.
+             */
+            UInt32 TotalRetransPkts() const noexcept {
+                std::lock_guard<std::recursive_mutex> scope(syncobj_);
+                return total_retrans_pkts_;
+            }
+            /** @brief Kernel tp->app_limited marker (0 = not limited). */
+            UInt32 AppLimitedMarker() const noexcept {
+                std::lock_guard<std::recursive_mutex> scope(syncobj_);
+                return cc_.app_limited;
+            }
+            /** @brief Kernel tp->delivered (PACKETS). */
+            UInt64 DeliveredPkts() const noexcept {
+                std::lock_guard<std::recursive_mutex> scope(syncobj_);
+                return cc_.delivered_pkts;
+            }
+            /** @brief Kernel tp->lost_out (PACKETS). */
+            UInt32 LostOutPkts() const noexcept {
+                std::lock_guard<std::recursive_mutex> scope(syncobj_);
+                return lost_out_pkts_;
+            }
+            /** @brief Kernel tp->retrans_out (PACKETS). */
+            UInt32 RetransOutPkts() const noexcept {
+                std::lock_guard<std::recursive_mutex> scope(syncobj_);
+                return retrans_out_pkts_;
+            }
+            /** @brief Kernel tp->dsack_dups (DSACK segments seen). */
+            UInt32 DsackDups() const noexcept {
+                std::lock_guard<std::recursive_mutex> scope(syncobj_);
+                return dsack_dups_;
+            }
+            /**
              * @brief Seconds-worth of MSL x2: how long TIME-WAIT connections
              *        linger before reclamation (RFC 793 2MSL). Default 120 s.
              */
@@ -727,6 +761,31 @@ namespace xtcp {
                 return fast_recovery_;
             }
             /**
+             * @brief Kernel tp->high_seq: snd_nxt snapshot of the current
+             *        cwnd-reduction episode (0 = no episode). Read-only
+             *        observability for the recovery state machine.
+             */
+            UInt32 HighSeq() const noexcept {
+                std::lock_guard<std::recursive_mutex> scope(syncobj_);
+                return high_seq_;
+            }
+            /**
+             * @brief Kernel tp->undo_retrans (-1 = nothing retransmitted).
+             *        Read-only observability for the recovery state machine.
+             */
+            Int32 UndoRetrans() const noexcept {
+                std::lock_guard<std::recursive_mutex> scope(syncobj_);
+                return undo_retrans_;
+            }
+            /**
+             * @brief RFC 3522 Eifel: an RTO retransmission awaits its ACK
+             *        (kernel tp->retrans_stamp presence). Read-only.
+             */
+            bool RtoPending() const noexcept {
+                std::lock_guard<std::recursive_mutex> scope(syncobj_);
+                return rto_pending_;
+            }
+            /**
              * @brief Sequence number of the oldest unacknowledged segment
              *        (the retransmit target), 0 when the queue is empty.
              */
@@ -787,6 +846,14 @@ namespace xtcp {
                  *        bytes-lost-since-last-sample accumulator).
                  */
                 Byte        lost = 0;
+                /**
+                 * @brief Kernel TCPCB_SACKED_RETRANS retired early: the
+                 *        segment was fully SACKed while marked LOST, so
+                 *        retrans_out already dropped its pkt_count
+                 *        (tcp_input_66.c:1392-1396). The pop path must not
+                 *        decrement it a second time.
+                 */
+                Byte        retrans_out_retired = 0;
                 buf::BufRef data;          /**< Payload reference (zero-copy retransmit) */
             };
 
@@ -988,11 +1055,25 @@ namespace xtcp {
                                     bool has_fin, TimePoint now, UInt32 ts_val = 0) noexcept;
             void CutCwnd() noexcept;
             /**
+             * @brief Kernel tcp_end_cwnd_reduction: close a cwnd-reduction
+             *        episode (CWR or Recovery). Honours the cong_control early
+             *        return, the TCP_INFINITE_SSTHRESH sentinel guard and the
+             *        CWR/undo_marker condition, then dispatches
+             *        kCaEventCompleteCwr.
+             */
+            void EndCwndReduction() noexcept;
+            /**
              * @brief Sets the kernel icsk_ca_state mirror (0=Open, 3=Recovery,
              *        4=Loss) and forwards it to the CC set_state hook when the
              *        state actually changes.
              */
             void SetCaState(Byte new_state) noexcept;
+            /**
+             * @brief Kernel tcp_may_undo: may the current episode be undone?
+             *        Batch 1: undo_marker_ only. Batch 2 (D05) adds
+             *        undo_retrans_ and the RFC 3522 "packet delayed" test.
+             */
+            bool TcpMayUndo(const TcpOpts* opts) noexcept;
             /**
              * @brief Kernel tcp_rate_check_app_limited equivalent, called at
              *        the application send entry BEFORE consuming new data:
@@ -1003,6 +1084,13 @@ namespace xtcp {
              *        marker is cleared only when delivered passes it).
              */
             void MaybeMarkAppLimited(UInt32 inflight) noexcept;
+            /**
+             * @brief Kernel tcp_rate_gen's app-limited clear
+             *        (tcp_rate_66.c:123-125): runs on EVERY ACK, cumulative
+             *        and duplicate alike. after() comparison in the PACKET
+             *        domain (marker = delivered_pkts watermark).
+             */
+            void ClearAppLimitedMarker() noexcept;
             /**
              * @brief Dispatches kCaEventTxStart when a data segment is about
              *        to leave an empty pipe (kernel CA_EVENT_TX_START).
@@ -1122,9 +1210,13 @@ namespace xtcp {
             const cc::XtcpCongestionOps* cc_ops_ = NULLPTR;  /**< Plugged algorithm (NULLPTR = Reno); points at cc_ops_owner_ */
             bool        fast_recovery_ = false;  /**< RFC 5681 fast recovery active */
             bool        ack_not_dup_ = false;    /**< Current ACK carries data/SYN/FIN: not a dupack (RFC 5681 s2) */
-            UInt32      recover_fs_ = 0;   /**< RFC 6937 PRR: flight size at the recovery entry */
-            UInt32      prr_delivered_ = 0; /**< RFC 6937 PRR: bytes delivered during recovery */
-            UInt32      prr_out_ = 0;       /**< RFC 6937 PRR: bytes sent during recovery */
+            UInt32      recover_fs_ = 0;   /**< RFC 6937 PRR: flight size at the recovery entry, PACKETS
+                                                (kernel tp->recover_fs is in packets: tcp_packets_in_flight) */
+            UInt32      prr_delivered_ = 0; /**< RFC 6937 PRR: PACKETS delivered during recovery
+                                                 (kernel tp->prr_delivered; tcp_cwnd_reduction's
+                                                 newly_acked_sacked is a packet count) */
+            UInt32      prr_out_ = 0;       /**< RFC 6937 PRR: PACKETS sent during recovery
+                                                 (kernel tp->prr_out) */
             bool        sack_ok_ = false;        /**< RFC 2018: peer negotiated SACK (SACK-permitted on SYN/SYN+ACK) */
             bool        timestamps_ok_ = false;  /**< RFC 7323: peer negotiated TCP timestamps (both SYNs carried TSopt) */
             bool        peer_ts_offered_ = false; /**< RFC 7323: the peer's SYN carried the TSopt */
@@ -1134,6 +1226,21 @@ namespace xtcp {
             UInt32      ts_recent_stamp_ = 0;    /**< RFC 7323 s5.5: ms clock when TsRecent was stored (PAWS aging - a 24-day idle relaxes the check) */
             bool        tso_tx_ = false;         /**< TSO direct-sends enabled (backend kCapTsoTx + no qdisc) */
             UInt32      retransmit_count_ = 0;   /**< Total retransmissions (RTO + fast) */
+            /**
+             * @brief Kernel tp->total_retrans (PACKETS): every retransmission
+             *        adds tcp_skb_pcount (tcp_output_66.c:3325). The DSACK
+             *        credibility gate compares dsack_dups against THIS, not
+             *        against the event counter retransmit_count_ (a single
+             *        TSO retransmission is several packets).
+             */
+            UInt32      total_retrans_pkts_ = 0;
+            /**
+             * @brief Kernel tp->max_window: the largest receive window the
+             *        peer has advertised (tcp_input_66.c:3596-3597,
+             *        tcp_input_66.c:6409). A DSACK block larger than this is
+             *        dubious and must be rejected (tcp_input_66.c:1015-1017).
+             */
+            UInt32      max_window_ = 0;
             UInt32      rack_losses_ = 0;        /**< RFC 8985 RACK: loss verdicts that entered recovery */
             UInt32      er_losses_ = 0;          /**< RFC 5827 Early Retransmit: ER entries that entered recovery */
             UInt32      dsack_undos_ = 0;        /**< RFC 2883 D-SACK: spurious-recovery undos */
@@ -1149,8 +1256,50 @@ namespace xtcp {
             UInt32      prior_cwnd_ = 0;         /**< Pre-recovery cwnd (spurious fast-recovery undo) */
             UInt32      prior_ssthresh_ = 0;     /**< Pre-recovery ssthresh (spurious fast-recovery undo) */
             bool        undo_marker_ = false;    /**< No-SACK fast-recovery entry: undo candidate */
+            /**
+             * @brief Kernel tp->undo_retrans: retransmissions still in flight
+             *        when the episode was entered, decremented as their ACKs
+             *        arrive; -1 = "nothing retransmitted" (kernel tcp_init_undo
+             *        uses `retrans_out ?: -1`). Gates tcp_may_undo together with
+             *        undo_marker_. Batch 1 only writes it (no reader yet);
+             *        batch 2 (D05) wires the predicate.
+             */
+            Int32       undo_retrans_ = -1;
+            /**
+             * @brief Kernel `tp->undo_marker == 0` as seen by
+             *        tcp_end_cwnd_reduction (tcp_input.c:2676-2680): has THIS
+             *        episode's window already been restored by an undo?
+             *
+             * The port's `undo_marker_` cannot carry that meaning: the SACK
+             * entry sets it false (a SACK-confirmed loss never undoes), which
+             * would make the kernel's `state == CWR || undo_marker` guard false
+             * on a plain Recovery exit and skip the `cwnd = snd_ssthresh`
+             * collapse (audit review batch1, defect 2). This flag is true
+             * whenever the current episode has NOT been undone yet, so the
+             * guard is `2 == ca_state || !episode_undone_`.
+             *
+             * Set false at every episode entry (CutCwnd covers RTO/RACK/dup-ACK,
+             * plus the ECN CWR entry); set true at every undo site (DSACK,
+             * Eifel, recovery-exit undo, held-episode undo) - the kernel clears
+             * undo_marker in tcp_undo_cwnd_reduction (tcp_input.c:2526).
+             */
+            bool        episode_undone_ = true;
             UInt32      rto_ts_val_ = 0;         /**< RFC 3522 Eifel: TSval of the last data retransmission */
+
             bool        rto_pending_ = false;    /**< RFC 3522 Eifel: an RTO retransmission awaits its ACK */
+            /**
+             * @brief Kernel tp->retrans_stamp: the TSval of the FIRST
+             *        retransmission of the current episode. Successive
+             *        retransmissions must NOT advance it (kernel comment
+             *        tcp_input.c:2454-2457). Batch 2 (D03) owns it.
+             */
+            UInt32      retrans_stamp_ts_ = 0;
+            /**
+             * @brief Sequence end of the segment the last RTO retransmitted;
+             *        a cumulative ACK reaching it answers the "spurious?"
+             *        question even without TSopt. Batch 2 (D04) owns it.
+             */
+            UInt32      rto_retx_end_ = 0;
             TimePoint   tlp_deadline_ = 0;       /**< Tail-loss probe deadline (RFC 8985 TLP) */
             bool        tlp_armed_ = false;      /**< A TLP probe is pending */
             TimePoint   first_outstanding_ = 0;  /**< Send time of the oldest unacked segment (TCP_USER_TIMEOUT anchor; immune to the Karn sent_at clear) */

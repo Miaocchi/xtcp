@@ -658,6 +658,8 @@ namespace {
         };
 
         const UInt32 kSteps = 3000;
+        UInt32 cycle_moves = 0;
+        UInt32 last_cycle = d.Snap().cycle_idx;
         for (UInt32 i = 0; i < kSteps; ++i) {
             UInt32 rtt_us;
             if (i < 200) {
@@ -670,8 +672,16 @@ namespace {
             const UInt32 acked = 1 + (next() % 4);
             const UInt32 delivered = acked * kMss;
             const UInt32 lost = (0 == (i % 700)) ? delivered : 0;
-            const UInt32 interval_us = 10000 + (next() % 5000);
-            d.Ack(rtt_us, interval_us, delivered, lost);
+            // B8-D2: a DELIVERED round boundary must move with the ACK
+            // stream. Ack()'s default prior_delivered = 0 opens only the
+            // very first round, so the old 3000-step loop never left
+            // STARTUP. Round() passes the pre-ACK delivered total.
+            d.Round(rtt_us, delivered, lost);
+            const KccSnapshot s = d.Snap();
+            if (s.cycle_idx != last_cycle) {
+                ++cycle_moves;
+                last_cycle = s.cycle_idx;
+            }
 
             CheckFullSnapshot(d);
             CHECK(kcc_core_cwnd_segs(&d.ref) == static_cast<s64>(d.sk.snd_cwnd));
@@ -681,6 +691,11 @@ namespace {
                 break;
             }
         }
+        // Coverage guard (B8-D2): the stream must exercise delivered rounds,
+        // full-bw detection (STARTUP -> DRAIN) and the PROBE_BW cycle.
+        CHECK(4 <= d.Snap().rtt_cnt);
+        CHECK(0 != d.Snap().full_bw_reached);
+        CHECK(0 < cycle_moves);
     }
 
     void TestKccRegistry() {
@@ -1308,6 +1323,678 @@ namespace {
         }
     };
 
+    /** @brief Delivers a raw ACK (optionally with one SACK block) to conn. */
+    void DeliverRawAck(xtcp::core::TcpConn& conn, xtcp::core::TimePoint now, UInt32 ack,
+                       UInt16 flags = xtcp::core::kFlagAck, bool sack = false,
+                       UInt32 sl = 0, UInt32 sr = 0, UInt16 window = 65535) {
+        const std::vector<Byte> seg = BuildSeg(40000, 443, 201, ack, flags, window, sack, sl, sr);
+        conn.OnSegment(seg.data(), static_cast<UInt32>(seg.size()), now);
+    }
+
+    /**
+     * @brief Raw segment with an RFC 7323 TSopt (plus optional MSS/SACK).
+     *
+     * BuildSeg above cannot carry timestamps, and the batch-2 Eifel tests need
+     * to negotiate TSopt through a REAL SYN/SYN+ACK exchange (timestamps_ok_ is
+     * only assigned on the handshake paths, tcp_fsm.cpp:4919 / :5118) and then
+     * control the tsecr of the ACK under test.
+     */
+    std::vector<Byte> BuildSegTs(UInt16 sport, UInt16 dport, UInt32 seq, UInt32 ack,
+                                 UInt16 flags, UInt16 window, UInt32 ts_val, UInt32 ts_ecr,
+                                 bool sack = false, UInt32 sl = 0, UInt32 sr = 0,
+                                 bool mss_opt = false) {
+        const UInt32 opt = (mss_opt ? 4u : 0u) + (sack ? 12u : 0u) + 12u;
+        std::vector<Byte> seg(20 + opt, 0);
+        Byte* t = seg.data();
+        t[0] = static_cast<Byte>(sport >> 8); t[1] = static_cast<Byte>(sport & 0xFF);
+        t[2] = static_cast<Byte>(dport >> 8); t[3] = static_cast<Byte>(dport & 0xFF);
+        t[4] = static_cast<Byte>(seq >> 24); t[5] = static_cast<Byte>(seq >> 16);
+        t[6] = static_cast<Byte>(seq >> 8); t[7] = static_cast<Byte>(seq & 0xFF);
+        t[8] = static_cast<Byte>(ack >> 24); t[9] = static_cast<Byte>(ack >> 16);
+        t[10] = static_cast<Byte>(ack >> 8); t[11] = static_cast<Byte>(ack & 0xFF);
+        t[12] = static_cast<Byte>(((20 + opt) / 4) << 4);
+        t[13] = static_cast<Byte>(((flags & xtcp::core::kFlagFin) ? 0x01 : 0x00) |
+                                  ((flags & xtcp::core::kFlagSyn) ? 0x02 : 0x00) |
+                                  ((flags & xtcp::core::kFlagRst) ? 0x04 : 0x00) |
+                                  ((flags & xtcp::core::kFlagPsh) ? 0x08 : 0x00) |
+                                  ((flags & xtcp::core::kFlagAck) ? 0x10 : 0x00) |
+                                  ((flags & xtcp::core::kFlagEce) ? 0x40 : 0x00));
+        t[14] = static_cast<Byte>(window >> 8);
+        t[15] = static_cast<Byte>(window & 0xFF);
+        UInt32 o = 20;
+        if (mss_opt) {
+            t[o] = 2; t[o + 1] = 4; t[o + 2] = 0x05; t[o + 3] = 0xB4;
+            o += 4;
+        }
+        if (sack) {
+            t[o] = 5; t[o + 1] = 10;
+            t[o + 2] = static_cast<Byte>(sl >> 24); t[o + 3] = static_cast<Byte>(sl >> 16);
+            t[o + 4] = static_cast<Byte>(sl >> 8);  t[o + 5] = static_cast<Byte>(sl & 0xFF);
+            t[o + 6] = static_cast<Byte>(sr >> 24); t[o + 7] = static_cast<Byte>(sr >> 16);
+            t[o + 8] = static_cast<Byte>(sr >> 8);  t[o + 9] = static_cast<Byte>(sr & 0xFF);
+            t[o + 10] = 1; t[o + 11] = 1;
+            o += 12;
+        }
+        t[o] = 8; t[o + 1] = 10;
+        t[o + 2] = static_cast<Byte>(ts_val >> 24); t[o + 3] = static_cast<Byte>(ts_val >> 16);
+        t[o + 4] = static_cast<Byte>(ts_val >> 8);  t[o + 5] = static_cast<Byte>(ts_val & 0xFF);
+        t[o + 6] = static_cast<Byte>(ts_ecr >> 24); t[o + 7] = static_cast<Byte>(ts_ecr >> 16);
+        t[o + 8] = static_cast<Byte>(ts_ecr >> 8);  t[o + 9] = static_cast<Byte>(ts_ecr & 0xFF);
+        t[o + 10] = 1; t[o + 11] = 1;
+        return seg;
+    }
+
+    /** @brief TSopt tsval of a stored IPv4 packet (0 when absent). */
+    UInt32 TsvalOf(const xtcp::buf::BufRef& p) {
+        if (p.IsEmpty()) {
+            return 0;
+        }
+        const Byte* d = p.Data();
+        const UInt32 ihl = static_cast<UInt32>(d[0] & 0x0F) * 4;
+        if (p.Len() < ihl + 20) {
+            return 0;
+        }
+        const UInt32 tcp_len = static_cast<UInt32>(d[ihl + 12] >> 4) * 4;
+        for (UInt32 o = ihl + 20; o + 1 < ihl + tcp_len;) {
+            const Byte kind = d[o];
+            if (0 == kind || 1 == kind) {
+                ++o;
+                continue;
+            }
+            const Byte len = d[o + 1];
+            if (8 == kind && 10 == len) {
+                return (static_cast<UInt32>(d[o + 2]) << 24) |
+                       (static_cast<UInt32>(d[o + 3]) << 16) |
+                       (static_cast<UInt32>(d[o + 4]) << 8) |
+                       static_cast<UInt32>(d[o + 5]);
+            }
+            if (len < 2) {
+                break;
+            }
+            o += len;
+        }
+        return 0;
+    }
+
+    /**
+     * @brief T2-1 (D03): the Eifel verdict must require the echoed TSval to be
+     *        STRICTLY BEFORE the first retransmission's TSval.
+     *
+     * Kernel tcp_tsopt_ecr_before (tcp_input.c:2418-2422):
+     *   saw_tstamp && rcv_tsecr && before(rcv_tsecr, when)
+     * so an ACK for data sent AFTER the RTO (a NEWER tsecr) is a REAL loss and
+     * must keep the cut. The old code undid on "tsecr != rto_ts_val_".
+     *
+     * The fixture negotiates TSopt through a real SYN/SYN+ACK exchange:
+     * timestamps_ok_ is only assigned on the handshake paths, never by a
+     * direct kEstablished construction.
+     */
+    void TestEifelRejectsNewerTsval() {
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kSynSent, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSndBuf(4u << 20);
+        xtcp::core::TimePoint now = 1000;
+        conn.SendSyn();  // our SYN carries the TSopt offer (syn_ts_offered_)
+        CHECK(1 == tx.size());
+        const UInt32 our_syn_ts = TsvalOf(tx.back());
+        CHECK(0 != our_syn_ts);
+        // Peer's SYN+ACK also carries the TSopt -> timestamps_ok_ = true.
+        const std::vector<Byte> synack = BuildSegTs(
+            443, 40000, 500, 101,
+            static_cast<UInt16>(xtcp::core::kFlagSyn | xtcp::core::kFlagAck), 65535,
+            777, our_syn_ts, false, 0, 0, true);
+        conn.OnSegment(synack.data(), static_cast<UInt32>(synack.size()), now);
+        CHECK(xtcp::core::TcpState::kEstablished == conn.State());
+
+        for (UInt32 i = 0; i < 6; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        CHECK(6 * kMss == conn.SndInflight());
+        // RTO: retransmits the front with a fresh TSval.
+        now += 3000000;
+        conn.OnRetransmitTimer(now);
+        const UInt32 cwnd_rto = conn.Cwnd();
+        const UInt32 ssth_rto = conn.Ssthresh();
+        const UInt32 rto_ts = TsvalOf(tx.back());
+        CHECK(0 != rto_ts);
+        // Cumulative ACK for the retransmitted segment, echoing a NEWER TSval
+        // (data sent after the RTO) -> real loss, no undo.
+        now += 20000;
+        const UInt32 ack = conn.SndUna() + kMss;
+        const std::vector<Byte> a = BuildSegTs(
+            40000, 443, 201, ack, xtcp::core::kFlagAck, 65535, 888, rto_ts + 1000);
+        conn.OnSegment(a.data(), static_cast<UInt32>(a.size()), now);
+        std::fprintf(stderr,
+                     "[T2-1] rto_ts=%u tsecr=%u | rto(cwnd=%u ssth=%u) -> after ACK "
+                     "cwnd=%u ssth=%u\n",
+                     rto_ts, rto_ts + 1000, cwnd_rto, ssth_rto, conn.Cwnd(), conn.Ssthresh());
+        CHECK(conn.Ssthresh() <= ssth_rto);   // not undone
+        CHECK(conn.Cwnd() <= cwnd_rto + 2);
+    }
+
+    /**
+     * @brief T2-2 (D04): a no-TSopt RTO must still be ADJUDICATED by a
+     *        cumulative ACK that covers the retransmitted range, so the sticky
+     *        `rto_pending_` can no longer disable the D-SACK undo forever.
+     *
+     * Kernel tcp_packet_delayed (tcp_input.c:2437-2441) needs TSopt evidence
+     * the port never has (data segments omit TSopt by design), so the verdict
+     * is "real loss" - but it IS a verdict, and tcp_may_undo's
+     * `!tp->undo_retrans || tcp_packet_delayed(tp)` then reopens the D-SACK
+     * path (tcp_try_undo_dsack, tcp_input.c:2580-2593).
+     *
+     * The primary observable is therefore the VERDICT ITSELF (RtoPending()),
+     * not a window number: on HEAD the flag is never cleared without TSopt, so
+     * it stays true for the rest of the connection's life. The D-SACK half is
+     * checked on the same ACK (before/after) so ordinary ACK-clock growth
+     * cannot mask or fake it.
+     */
+    void TestDsackUndoAfterRtoWithoutTsopt() {
+        FsmHarness h;   // no SetPeerTimestampsOffered -> timestamps_ok_ = false
+        // Reno: the recorder CC the harness installs owns cwnd through its
+        // cong_control hook, so the window would not regrow between the two
+        // episodes. The D-SACK undo restores prior_cwnd_, which must be
+        // observably larger than the cut (a4probe35 uses a plain Reno conn).
+        CHECK(h.conn.SetCongestionControl(""));
+        h.conn.SetSackOk(true);
+        h.conn.SetSndBuf(4u << 20);
+        for (UInt32 r = 0; r < 8; ++r) {
+            const UInt32 cwnd = h.conn.Cwnd();
+            for (UInt32 i = 0; i < cwnd; ++i) {
+                h.Send(kMss);
+            }
+            h.now += 20000;
+            h.Deliver(h.conn.SndNxt());
+        }
+        const UInt32 cwnd_pre = h.conn.Cwnd();
+        // Episode 1: RTO (no TSopt anywhere on this connection).
+        h.Send(kMss);
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        const UInt32 cwnd_rto = h.conn.Cwnd();
+        const bool pending_at_rto = h.conn.RtoPending();
+        // The covering ACK answers the "spurious?" question: real loss.
+        h.now += 20000;
+        h.Deliver(h.conn.SndNxt());
+        const bool pending_after_ack = h.conn.RtoPending();
+        std::fprintf(stderr,
+                     "[T2-2] warm cwnd=%u | after RTO cwnd=%u rto_pending=%d | after covering "
+                     "ACK cwnd=%u rto_pending=%d\n",
+                     cwnd_pre, cwnd_rto, pending_at_rto ? 1 : 0, h.conn.Cwnd(),
+                     pending_after_ack ? 1 : 0);
+        CHECK(pending_at_rto);            // the RTO armed a verdict window
+        CHECK(!pending_after_ack);        // HEAD: sticky true (D04)
+
+        // Second half: the D-SACK undo must be able to fire afterwards. The
+        // comparison is the SAME ACK's before/after window, so ACK-clock growth
+        // from earlier ACKs cannot be mistaken for an undo.
+        for (UInt32 r = 0; r < 40; ++r) {
+            const UInt32 cwnd = h.conn.Cwnd();
+            for (UInt32 i = 0; i < cwnd; ++i) {
+                h.Send(kMss);
+            }
+            h.now += 20000;
+            h.Deliver(h.conn.SndNxt());
+        }
+        for (UInt32 i = 0; i < 3; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        for (UInt32 i = 0; i < 3; ++i) {
+            h.now += 1000;
+            h.Deliver(una);
+        }
+        CHECK(h.conn.FastRecovery());
+        const UInt32 cwnd_cut = h.conn.Cwnd();
+        const UInt32 ssth_cut = h.conn.Ssthresh();
+        // D-SACK covering the retransmitted range (block end == ACK).
+        h.now += 1000;
+        h.Deliver(una + kMss, xtcp::core::kFlagAck, 65535, true, una, una + kMss);
+        const UInt32 cwnd_dsack = h.conn.Cwnd();
+        const bool fr_after = h.conn.FastRecovery();
+        const UInt32 high_after = h.conn.HighSeq();
+        std::fprintf(stderr,
+                     "[T2-2] cut cwnd=%u ssth=%u -> after D-SACK cwnd=%u ssth=%u "
+                     "fast_recovery=%d high_seq=%u\n",
+                     cwnd_cut, ssth_cut, cwnd_dsack, h.conn.Ssthresh(),
+                     fr_after ? 1 : 0, high_after);
+        // The D-SACK undo closes the episode: kernel tcp_try_undo_dsack ->
+        // tcp_undo_cwnd_reduction -> tcp_try_keep_open (tcp_input.c:2580-2593).
+        // HEAD leaves the recovery open (fr=1, high_seq intact) because the
+        // sticky rto_pending_ keeps the gate at :2699 closed.
+        CHECK(!fr_after);
+        CHECK(0u == high_after);
+        CHECK(cwnd_dsack > cwnd_cut);          // D-SACK undo fired
+        CHECK(ssth_cut <= h.conn.Ssthresh());  // not re-cut (weak guard)
+    }
+
+    /**
+     * @brief Loss-mark probe CC for T2-3.
+     *
+     * The observable MUST NOT be the undo_cwnd hook: HEAD's exit branch is an
+     * inline `cc_.snd_cwnd = prior_cwnd_` (no hook call anywhere in the HEAD
+     * tcp_fsm.cpp), so a hook counter reads 0 on both sides and cannot be red.
+     *
+     * Instead the ssthresh hook hands out DIFFERENT finite marks per call: the
+     * RTO's cut (first call) leaves a large mark, the later no-SACK entry saves
+     * it as prior_ssthresh_ and cuts to a smaller one. An undo restores
+     * prior_ssthresh_ (the larger value, kernel tcp_undo_cwnd_reduction
+     * tcp_input.c:2515-2523); a refused undo leaves the smaller mark.
+     */
+    UInt32 g_b2SsthCalls = 0;
+    UInt32 B2FiniteSsthresh(XtcpConnCc*) noexcept {
+        ++g_b2SsthCalls;
+        return (1 == g_b2SsthCalls) ? 8u : 3u;
+    }
+
+    /**
+     * @brief T2-3 (D05): do not undo while retransmissions are still in
+     *        flight - their D-SACKs may yet prove the cut was wrong.
+     *
+     * Kernel tcp_may_undo (tcp_input.c:2530-2533) with undo_retrans > 0 and no
+     * TSopt evidence refuses; the port expressed that as `undo_retrans_ <= 0`.
+     */
+    void TestNoUndoWhileRetransInFlight() {
+        static bool registered = false;
+        if (!registered) {
+            XtcpCongestionOps ops;
+            ops.name = "b2_finite_ssth";
+            ops.ssthresh = B2FiniteSsthresh;   // finite loss marks -> restore visible
+            CHECK(xtcp::cc::RegisterCongestionControl(ops));
+            registered = true;
+        }
+        FsmHarness h;
+        CHECK(h.conn.SetCongestionControl("b2_finite_ssth"));
+        h.conn.SetSackOk(false);   // no-SACK entry -> undo_marker_ = true on HEAD
+        h.conn.SetSndBuf(4u << 20);
+        g_b2SsthCalls = 0;
+        for (UInt32 i = 0; i < 8; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        // RTO: one retransmission goes out and its ACK never arrives, so
+        // retrans_out > 0 when the next episode is entered.
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        CHECK(0 < h.conn.RetransmitCount());
+        const UInt32 cwnd_rto = h.conn.Cwnd();
+        // A NEW no-SACK entry while that retransmission is still in flight:
+        // CutCwnd records undo_retrans_ > 0 (kernel tcp_init_undo's
+        // `retrans_out ?: -1`, tcp_input.c:2106-2111).
+        for (UInt32 i = 0; i < 3; ++i) {
+            h.now += 1000;
+            h.Deliver(una);
+        }
+        CHECK(h.conn.FastRecovery());
+        // Precondition (the point of this test): a retransmission was still in
+        // flight when the episode was entered. Observed through the
+        // retransmission counter, not UndoRetrans(): HEAD never writes that
+        // field (it stays at its -1 initializer), so asserting on it would make
+        // the red case fail for a missing field instead of for behaviour.
+        CHECK(0 < h.conn.RetransmitCount());
+        const UInt32 cwnd_cut = h.conn.Cwnd();
+        const UInt32 ssth_cut = h.conn.Ssthresh();
+        CHECK(ssth_cut < 8u);   // the entry cut to the smaller mark
+        // Push snd_nxt above high_seq_ so the exit ACK takes the part-D branch
+        // instead of Reno's hold-at-high_seq (tcp_is_non_sack_preventing_reopen,
+        // tcp_input.c:2535-2548).
+        h.Send(kMss);
+        // Clean cumulative ACK above high_seq_ ends the recovery: it must NOT
+        // restore the window/ssthresh.
+        h.now += 20000;
+        h.Deliver(h.conn.SndNxt());
+        const UInt32 ssth_after = h.conn.Ssthresh();
+        std::fprintf(stderr,
+                     "[T2-3] after RTO cwnd=%u | entry cwnd=%u ssth=%u -> "
+                     "after exit ACK cwnd=%u ssth=%u\n",
+                     cwnd_rto, cwnd_cut, ssth_cut, h.conn.Cwnd(), ssth_after);
+        // No undo: the entry's loss mark stands. HEAD restores prior_ssthresh_
+        // (the RTO's larger mark) through the inline assignment.
+        CHECK(ssth_cut == ssth_after);
+    }
+
+    /**
+     * @brief T2-4 (D05, the missing INCREMENT): a retransmission the episode
+     *        itself emits must count against undo_retrans, so the clean exit
+     *        cannot undo a REAL loss.
+     *
+     * Kernel tcp_output_66.c:3390-3392 (inside tcp_retransmit_skb, i.e. every
+     * retransmission actually put on the wire):
+     *     if (tp->undo_retrans < 0) tp->undo_retrans = 0;
+     *     tp->undo_retrans += tcp_skb_pcount(skb);
+     * together with the entry assignment `undo_retrans = retrans_out ?: -1`
+     * (tcp_input.c:2110). A no-SACK dup-ACK entry runs tcp_init_undo BEFORE the
+     * fast retransmit, so the entry value is -1 and only the increment makes the
+     * counter positive - which is exactly what makes tcp_may_undo
+     * (tcp_input.c:2530-2533) refuse the undo without TSopt evidence.
+     *
+     * Fixture: no prior RTO (retrans_out == 0 at entry), then the entry's own
+     * fast retransmit goes out, then a clean ACK above high_seq_ ends the
+     * recovery. The window must collapse to ssthresh, not be restored.
+     */
+    void TestNoUndoWhenOwnRetransmitCounts() {
+        static bool registered = false;
+        if (!registered) {
+            XtcpCongestionOps ops;
+            ops.name = "b2_own_retx";
+            ops.ssthresh = B2FiniteSsthresh;   // finite marks 8 then 3
+            CHECK(xtcp::cc::RegisterCongestionControl(ops));
+            registered = true;
+        }
+        FsmHarness h;
+        CHECK(h.conn.SetCongestionControl("b2_own_retx"));
+        h.conn.SetSackOk(false);   // no-SACK entry -> undo candidate
+        h.conn.SetSndBuf(4u << 20);
+        g_b2SsthCalls = 0;
+        for (UInt32 i = 0; i < 8; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        const UInt32 retx_before = h.conn.RetransmitCount();
+        // No RTO here: retrans_out == 0 at the entry, so the entry value is the
+        // kernel's -1 and ONLY the increment can make it positive.
+        for (UInt32 i = 0; i < 3; ++i) {
+            h.now += 1000;
+            h.Deliver(una);
+        }
+        CHECK(h.conn.FastRecovery());
+        // The entry's own fast retransmit actually went out.
+        const UInt32 retx_after = h.conn.RetransmitCount();
+        CHECK(retx_before < retx_after);
+        const UInt32 cwnd_cut = h.conn.Cwnd();
+        const UInt32 ssth_cut = h.conn.Ssthresh();
+        // Push snd_nxt above high_seq_ so the exit ACK takes the part-D branch
+        // (not Reno's hold-at-high_seq).
+        h.Send(kMss);
+        h.now += 20000;
+        h.Deliver(h.conn.SndNxt());
+        std::fprintf(stderr,
+                     "[T2-4] retx %u -> %u | entry cwnd=%u ssth=%u -> after exit ACK "
+                     "cwnd=%u ssth=%u\n",
+                     retx_before, retx_after, cwnd_cut, ssth_cut,
+                     h.conn.Cwnd(), h.conn.Ssthresh());
+        // No undo: the episode's own retransmission counts, so the cut stands.
+        // The observable is ssthresh, not cwnd: the same ACK also runs
+        // tcp_cong_control with the state already Open, so slow start grows cwnd
+        // on top of the collapse (kernel tcp_input.c:3939-3941).
+        CHECK(ssth_cut == h.conn.Ssthresh());
+    }
+
+    /**
+     * @brief KCC with a recording wrapper: the real plugin's behaviour plus
+     *        the icsk_ca_state observed at the cong_control hook.
+     */
+    const XtcpCongestionOps* g_kccOps = NULLPTR;
+
+    void KccRecInit(XtcpConnCc* sk) noexcept {
+        if (NULLPTR != g_kccOps && NULLPTR != g_kccOps->init) {
+            g_kccOps->init(sk);
+        }
+    }
+    void KccRecRelease(XtcpConnCc* sk) noexcept {
+        if (NULLPTR != g_kccOps && NULLPTR != g_kccOps->release) {
+            g_kccOps->release(sk);
+        }
+    }
+    UInt32 KccRecSsthresh(XtcpConnCc* sk) noexcept {
+        return (NULLPTR != g_kccOps && NULLPTR != g_kccOps->ssthresh)
+            ? g_kccOps->ssthresh(sk) : sk->snd_ssthresh;
+    }
+    void KccRecSetState(XtcpConnCc* sk, Byte new_state) noexcept {
+        if (NULLPTR != g_kccOps && NULLPTR != g_kccOps->set_state) {
+            g_kccOps->set_state(sk, new_state);
+        }
+    }
+    void KccRecEvent(XtcpConnCc* sk, xtcp::cc::CaEvent ev) noexcept {
+        if (NULLPTR != g_kccOps && NULLPTR != g_kccOps->cwnd_event) {
+            g_kccOps->cwnd_event(sk, ev);
+        }
+    }
+    UInt32 KccRecUndo(XtcpConnCc* sk) noexcept {
+        return (NULLPTR != g_kccOps && NULLPTR != g_kccOps->undo_cwnd)
+            ? g_kccOps->undo_cwnd(sk) : sk->snd_cwnd;
+    }
+    void KccRecControl(XtcpConnCc* sk, const RateSample* rs) noexcept {
+        g_recCaState = sk->ca_state;
+        ++g_recCalls;
+        if (NULLPTR != g_kccOps && NULLPTR != g_kccOps->cong_control) {
+            g_kccOps->cong_control(sk, rs);
+        }
+    }
+
+    void EnsureKccRecorder() {
+        static bool registered = false;
+        if (registered) {
+            return;
+        }
+        xtcp::cc::RegisterKcc();
+        g_kccOps = xtcp::cc::FindCongestionControl("kcc");
+        CHECK(NULLPTR != g_kccOps);
+        XtcpCongestionOps ops;
+        ops.name = "kcc_test_rec_fwd";
+        ops.init = KccRecInit;
+        ops.release = KccRecRelease;
+        ops.ssthresh = KccRecSsthresh;
+        ops.set_state = KccRecSetState;
+        ops.cwnd_event = KccRecEvent;
+        ops.undo_cwnd = KccRecUndo;
+        ops.cong_control = KccRecControl;
+        CHECK(xtcp::cc::RegisterCongestionControl(ops));
+        registered = true;
+    }
+
+    /**
+     * @brief "KCC shape" probe for the flush-order test: ssthresh passes the
+     *        sentinel through (like KccSsthresh) and cong_control owns the
+     *        window (pins it to 1 whenever the CA state is Open). The window
+     *        the FSM leaves behind at the exit is therefore observable in the
+     *        flush that follows.
+     */
+    UInt32 KccShapeSsthresh(XtcpConnCc* sk) noexcept {
+        return sk->snd_ssthresh;
+    }
+    void KccShapeControl(XtcpConnCc* sk, const RateSample*) noexcept {
+        if (0 == sk->ca_state) {
+            sk->snd_cwnd = 1;
+        }
+    }
+
+    /** Finite-threshold variant: the plugin keeps its own (rate-based) window
+     *  and only uses snd_ssthresh as a loss mark. */
+    UInt32 KccShapeFiniteSsthresh(XtcpConnCc*) noexcept {
+        return 3;
+    }
+    UInt32 g_recCwndAtHook = 0;
+    UInt32 g_recCompleteCwr = 0;
+    void KccShapeRecordOnly(XtcpConnCc* sk, const RateSample*) noexcept {
+        g_recCwndAtHook = sk->snd_cwnd;
+        ++g_recCalls;
+    }
+    void KccShapeEvent(XtcpConnCc*, xtcp::cc::CaEvent ev) noexcept {
+        if (xtcp::cc::kCaEventCompleteCwr == ev) {
+            ++g_recCompleteCwr;
+        }
+    }
+
+    /**
+     * @brief D01 (main red case): a rate-based CC (cong_control) owns the
+     *        window when a cwnd-reduction episode ends.
+     *
+     * Kernel tcp_end_cwnd_reduction (tcp_input.c:2669-2683) opens with
+     *   if (icsk_ca_ops->cong_control) return;
+     * so the FSM must not write `cwnd = ssthresh` for KCC/BBR, and must not
+     * dispatch CA_EVENT_COMPLETE_CWR either. KCC's ssthresh hook passes the
+     * current snd_ssthresh through (cc_kcc.cpp:1042), which is the
+     * 0x7FFFFFFF "unlimited" sentinel until DRAIN computes a BDP target, so
+     * the unconditional exit write handed KCC a 0x7FFFFFFF window (audit
+     * D01). The CA state must already be Open when the CC hook runs (kernel
+     * runs tcp_fastretrans_alert before tcp_cong_control).
+     *
+     * No warmup on purpose: once KccMain has a min_rtt sample its BDP clamp
+     * (cc_kcc.cpp:976-996) rewrites the sentinel, which would mask the
+     * defect. The no-RTT connection is exactly the shape the kernel guard
+     * protects (audit D01, a4probe37).
+     */
+    void TestKccRecoveryExitKeepsPriorCwnd() {
+        EnsureKccRecorder();
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSackOk(true);
+        conn.SetSndBuf(4u << 20);
+        CHECK(conn.SetCongestionControl("kcc_test_rec_fwd"));
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 4; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 cwnd_pre = conn.Cwnd();
+        CHECK(0x7FFFFFFFu == conn.Ssthresh());     // KCC on the sentinel
+        const UInt32 una = conn.SndUna();
+        // Three SACK dup-ACKs with a REAL gap: SACK-confirmed entry
+        // (undo_marker_ stays false, so the exit cannot undo).
+        for (UInt32 i = 0; i < 3; ++i) {
+            now += 1000;
+            DeliverRawAck(conn, now, una, xtcp::core::kFlagAck, true,
+                          una + kMss, una + 2 * kMss);
+        }
+        CHECK(conn.FastRecovery());
+        CHECK(conn.Cwnd() < cwnd_pre);             // the entry cut the window
+        g_recCalls = 0;
+        g_recCaState = 0xFF;
+        now += 20000;
+        DeliverRawAck(conn, now, conn.SndNxt());
+        CHECK(!conn.FastRecovery());
+        CHECK(1 <= g_recCalls);
+        CHECK(0u == g_recCaState);                 // state Open before the CC hook
+        CHECK(conn.Cwnd() < 0x1000u);              // red: 0x7FFFFFFF (D01)
+        CHECK(0 < conn.Cwnd());                    // a legal window
+    }
+
+    /**
+     * @brief D01 (second guard): a cong_control CC with a FINITE ssthresh.
+     *
+     * Kernel tcp_end_cwnd_reduction (tcp_input.c:2673-2674) returns before
+     * touching cwnd when the algorithm installs cong_control, so the window
+     * the CC owns survives the episode end. The dfe0b55 exit block wrote
+     * `cwnd = ssthresh` unconditionally, collapsing the rate-based window to
+     * the threshold the plugin only uses as a loss mark (KccSsthresh passes
+     * it through, cc_kcc.cpp:1042). The kernel also skips
+     * tcp_ca_event(CA_EVENT_COMPLETE_CWR) on that path.
+     */
+    void TestKccRecoveryExitKeepsCcWindow() {
+        static bool registered = false;
+        if (!registered) {
+            XtcpCongestionOps ops;
+            ops.name = "kcc_test_fin_ssth";
+            ops.ssthresh = KccShapeFiniteSsthresh;
+            ops.cong_control = KccShapeRecordOnly;
+            ops.cwnd_event = KccShapeEvent;
+            CHECK(xtcp::cc::RegisterCongestionControl(ops));
+            registered = true;
+        }
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSackOk(true);
+        conn.SetSndBuf(4u << 20);
+        CHECK(conn.SetCongestionControl("kcc_test_fin_ssth"));
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 10; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 una = conn.SndUna();
+        for (UInt32 i = 0; i < 3; ++i) {
+            now += 1000;
+            DeliverRawAck(conn, now, una, xtcp::core::kFlagAck, true,
+                          una + kMss, una + 2 * kMss);
+        }
+        CHECK(conn.FastRecovery());
+        const UInt32 cwnd_cut = conn.Cwnd();
+        CHECK(3u == conn.Ssthresh());        // the probe's finite threshold
+        CHECK(cwnd_cut > conn.Ssthresh());   // rate-based window != threshold
+        g_recCalls = 0;
+        g_recCwndAtHook = 0;
+        g_recCompleteCwr = 0;
+        now += 20000;
+        DeliverRawAck(conn, now, conn.SndNxt());
+        CHECK(!conn.FastRecovery());
+        CHECK(1 <= g_recCalls);
+        std::fprintf(stderr, "[d01-fin-ssth] cut=%u ssth=%u hook_cwnd=%u exit=%u\n",
+                     cwnd_cut, conn.Ssthresh(), g_recCwndAtHook, conn.Cwnd());
+        // Red: the hook saw cwnd=3 (the FSM had already collapsed it).
+        CHECK(cwnd_cut == g_recCwndAtHook);
+        CHECK(cwnd_cut == conn.Cwnd());
+        CHECK(0 == g_recCompleteCwr);        // kernel: no event on this path
+    }
+
+    /**
+     * @brief D01 (flush order): the buffered sends of the exit ACK must ride
+     *        the window the CC left behind, not the FSM's exit write.
+     *
+     * Kernel send order is tcp_rate_gen -> tcp_cong_control ->
+     * tcp_xmit_recovery (tcp_input.c:3938-3940): data leaves AFTER the CC has
+     * had its say. The port flushed at the top of the exit block, so one exit
+     * ACK released the whole backlog against the 0x7FFFFFFF window the block
+     * had just written (audit D01, a4probe27: 6 segments).
+     */
+    void TestExitAckDoesNotBurst() {
+        static bool registered = false;
+        if (!registered) {
+            // KCC-shaped probe: ssthresh passthrough (sentinel) + a
+            // cong_control that pins cwnd to 1 the moment it sees the state
+            // leave Recovery - the strongest possible "the CC owns cwnd".
+            XtcpCongestionOps ops;
+            ops.name = "kcc_test_shape";
+            ops.ssthresh = KccShapeSsthresh;
+            ops.cong_control = KccShapeControl;
+            CHECK(xtcp::cc::RegisterCongestionControl(ops));
+            registered = true;
+        }
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSackOk(true);
+        conn.SetSndBuf(4u << 20);
+        CHECK(conn.SetCongestionControl("kcc_test_shape"));
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 10; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 una = conn.SndUna();
+        for (UInt32 i = 0; i < 3; ++i) {
+            now += 1000;
+            DeliverRawAck(conn, now, una, xtcp::core::kFlagAck, true,
+                          una + kMss, una + 2 * kMss);
+        }
+        CHECK(conn.FastRecovery());
+        CHECK(0 < conn.Cwnd());
+        // Backlog: the recovery pipe gate buffers these instead of sending.
+        for (UInt32 i = 0; i < 40; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const size_t tx_before = tx.size();
+        now += 20000;
+        DeliverRawAck(conn, now, conn.SndNxt());
+        const size_t burst = tx.size() - tx_before;
+        std::fprintf(stderr, "[d01-flush] burst=%zu cwnd=%u\n", burst, conn.Cwnd());
+        CHECK(burst <= 2);   // red: 6 (flush ran before the CC hook)
+        CHECK(1u == conn.Cwnd());   // the CC's window survived the flush
+    }
+
     void TestKccFsmDelayedFields() {
         {
             // Single sub-MSS segment, clean ACK: delayed.
@@ -1508,6 +2195,11 @@ namespace {
      */
     void TestKccFsmCaStateReturnsToOpen() {
         FsmHarness h;
+        // SACK is negotiated: kernel tcp_is_non_sack_preventing_reopen
+        // (tcp_input.c:2535-2548) holds a NON-SACK recovery at exactly
+        // high_seq, while SACK is safe to reopen there. This case pins the
+        // reopen + state transition, so it must run the SACK variant.
+        h.conn.SetSackOk(true);
         h.Send(kMss);
         h.Send(kMss);
         h.Send(kMss);
@@ -1515,10 +2207,18 @@ namespace {
         const UInt32 una = h.conn.SndUna();
         const UInt32 end = h.conn.SndNxt();
         const UInt32 cwnd_before = h.conn.Cwnd();
-        // Three RAW dup-ACKs (no SACK blocks): no-SACK fast-recovery entry.
+        // Three RAW dup-ACKs (no SACK blocks) advertising a ZERO window: the
+        // no-SACK entry still arms undo_marker_, but RetransmitEarliestMissing
+        // skips the transmit (RFC 1122 s4.2.2.17, tcp_fsm.cpp's `0 == snd_wnd_`
+        // early return), so no retransmission is put on the wire and
+        // undo_retrans stays -1. That is the kernel's "Happy end! We did not
+        // retransmit anything" case (tcp_input.c:2558-2560) where tcp_may_undo
+        // legitimately allows the undo; with a real retransmission in flight
+        // tcp_may_undo refuses without TSopt evidence (tcp_input.c:2530-2533 +
+        // tcp_output_66.c:3390-3392).
         for (UInt32 i = 0; i < 3; ++i) {
             h.now += 1000;
-            h.Deliver(una, xtcp::core::kFlagAck);
+            h.Deliver(una, xtcp::core::kFlagAck, 0);
         }
         CHECK(h.conn.FastRecovery());          // recovery active
         // The cumulative ACK covers everything up to high_seq: the episode
@@ -1531,6 +2231,704 @@ namespace {
         CHECK(0u == g_recCaState);             // red: 3 (Recovery) before the fix
         CHECK(!h.conn.FastRecovery());
         CHECK(cwnd_before <= h.conn.Cwnd());   // window not re-cut by the CC
+    }
+
+    /**
+     * @brief Kernel tcp_is_non_sack_preventing_reopen (tcp_input.c:2535-2548):
+     *        a NON-SACK recovery is held at exactly high_seq - reopening there
+     *        lets the very next dup-ACK start a false fast retransmit
+     *        (RFC 2582). tcp_try_undo_recovery returns true in that case
+     *        (tcp_input.c:2572-2573), so tcp_fastretrans_alert part D returns
+     *        immediately (tcp_input.c:3015-3016) and the port's PRR block must
+     *        not close the episode either.
+     *
+     *        The CC hook still runs afterwards: tcp_cong_control is called
+     *        unconditionally by tcp_ack (tcp_input.c:3939), and with the state
+     *        still Recovery it takes tcp_cwnd_reduction (PRR) - it must NOT
+     *        take tcp_cong_avoid, i.e. it must not raise ssthresh/cwnd in
+     *        congestion avoidance.
+     */
+    void TestNonSackRecoveryHoldsAtHighSeq() {
+        FsmHarness h;              // recorder CC: no ssthresh hook (Reno path)
+        h.conn.SetSackOk(false);   // kernel tcp_is_reno(tp)
+        h.Send(kMss);
+        h.Send(kMss);
+        h.Send(kMss);
+        h.Send(kMss);
+        const UInt32 una = h.conn.SndUna();
+        const UInt32 end = h.conn.SndNxt();
+        for (UInt32 i = 0; i < 3; ++i) {
+            h.now += 1000;
+            h.Deliver(una);   // raw dup-ACK: no-SACK recovery entry
+        }
+        CHECK(h.conn.FastRecovery());
+        CHECK(0x7FFFFFFFu != h.conn.Ssthresh());   // the entry recorded a cut
+        const UInt32 cwnd_cut = h.conn.Cwnd();
+        // ACK exactly at high_seq: HELD, but the undo must have run first
+        // (kernel tcp_input.c:2555-2573).
+        g_recCalls = 0;
+        g_recCaState = 0xFF;
+        h.now += 20000;
+        h.Deliver(end);
+        CHECK(1 <= g_recCalls);
+        CHECK(3u == g_recCaState);                 // still Recovery at the hook
+        CHECK(h.conn.FastRecovery());
+        // The undo could not run (a retransmission is still in flight), so the
+        // cut window stands above ssthresh.
+        CHECK(h.conn.Cwnd() > h.conn.Ssthresh());
+        // Batch 4 (D08): this harness CC is a cong_control algorithm, so the
+        // kernel's tcp_cong_control returns EARLY (tcp_input.c:3518-3521) and
+        // tcp_cwnd_reduction is never called: the FSM must NOT rewrite the
+        // window on this ACK. Pre-D08 the byte-domain PRR block did rewrite it
+        // (1462 = ssthresh 2 + 1460 acked bytes), which is exactly the defect.
+        // The window must therefore still be the value the entry produced.
+        CHECK(h.conn.Cwnd() == cwnd_cut);
+        std::fprintf(stderr, "[hold-reno] cwnd=%u ssth=%u\n",
+                     h.conn.Cwnd(), h.conn.Ssthresh());
+        // The ACK above high_seq (new data sent after the held ACK) ends it.
+        h.Send(kMss);
+        CHECK(xtcp::core::SeqLt(end, h.conn.SndNxt()));
+        g_recCalls = 0;
+        g_recCaState = 0xFF;
+        h.now += 20000;
+        h.Deliver(h.conn.SndNxt());
+        CHECK(1 <= g_recCalls);
+        CHECK(0u == g_recCaState);
+        CHECK(!h.conn.FastRecovery());
+    }
+
+    /**
+     * @brief A Reno-path probe recording undo_cwnd calls and COMPLETE_CWR
+     *        events (kernel tcp_undo_cwnd_reduction / tcp_ca_event).
+     */
+    UInt32 g_probeUndoCalls = 0;
+    UInt32 g_probeCompleteCwr = 0;
+    Byte g_probeCaState = 0xFF;
+
+    UInt32 ProbeUndoCwnd(XtcpConnCc* sk) noexcept {
+        ++g_probeUndoCalls;
+        return sk->snd_cwnd;
+    }
+    void ProbeCwndEvent(XtcpConnCc*, xtcp::cc::CaEvent ev) noexcept {
+        if (xtcp::cc::kCaEventCompleteCwr == ev) {
+            ++g_probeCompleteCwr;
+        }
+    }
+    void ProbeSetState(XtcpConnCc*, Byte) noexcept {}
+
+    void EnsureUndoProbeCc() {
+        static bool registered = false;
+        if (registered) {
+            return;
+        }
+        XtcpCongestionOps ops;
+        ops.name = "kcc_test_undo_probe";
+        ops.undo_cwnd = ProbeUndoCwnd;
+        ops.cwnd_event = ProbeCwndEvent;
+        ops.set_state = ProbeSetState;
+        // NO cong_control and NO ssthresh: the classic Reno path, so
+        // EndCwndReduction's guards are actually exercised.
+        CHECK(xtcp::cc::RegisterCongestionControl(ops));
+        registered = true;
+    }
+
+    /**
+     * @brief Batch 4 (D08) T4-1: the PRR arithmetic must stay in PACKETS.
+     *
+     * Kernel tcp_cwnd_reduction (tcp_input.c:2643-2667) is entirely in packets:
+     * `tp->prr_delivered += newly_acked_sacked` where newly_acked_sacked comes
+     * from tcp_tso_acked, and sndcnt/delta are packet counts. The port used to
+     * add `acked` (BYTES) to a packet-domain ssthresh, so a 2*MSS partial ACK
+     * turned a 3-segment window into 2923 segments (probe P6).
+     */
+    void TestPrrStaysInPackets() {
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSackOk(true);
+        conn.SetSndBuf(4u << 20);
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 6; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 una = conn.SndUna();
+        for (UInt32 i = 0; i < 3; ++i) {
+            now += 1000;
+            DeliverRawAck(conn, now, una, xtcp::core::kFlagAck, true,
+                          una + 2 * kMss, una + 6 * kMss);
+        }
+        CHECK(conn.FastRecovery());
+        const UInt32 ssth = conn.Ssthresh();
+        // Partial ACK advancing 2*MSS with a SACK block leaving a gap: the PRR
+        // value survives (gaps_remain stays true, so no exit/undo overwrite).
+        now += 20000;
+        DeliverRawAck(conn, now, una + 2 * kMss, xtcp::core::kFlagAck, true,
+                      una + 3 * kMss, una + 6 * kMss);
+        std::fprintf(stderr, "[T4-1] ssth=%u partial_ack_cwnd=%u\n", ssth, conn.Cwnd());
+        // RED on HEAD: 2923 = ssthresh(3) + 2920 acked BYTES.
+        CHECK(conn.Cwnd() <= ssth + 8u);
+        // Coarse packet-domain sanity bound (the 2^31 sentinel shape is caught
+        // by this one; the exact red case above is the byte-domain 2923).
+        CHECK(conn.Cwnd() < 100000u);
+    }
+
+    /**
+     * @brief Batch 4 review (D): a RETRANSMISSION must spend PRR credit too.
+     *
+     * Kernel increments tp->prr_out in TWO places:
+     *   tcp_output_66.c:2787-2789  tcp_write_xmit        -> prr_out += sent_pkts
+     *   tcp_output_66.c:3461-3462  tcp_xmit_retransmit_queue
+     *                                                     -> prr_out += tcp_skb_pcount(skb)
+     * The port only mirrored the first (SendData / FlushPendingSend). In a SACK
+     * recovery whose progress is driven by RETRANSMISSIONS, prr_out_ stayed ~0
+     * while prr_delivered_ grew, so `cwnd = ssthresh + delivered - out` climbed
+     * monotonically and PRR stopped pacing the recovery (probe a4rev60:
+     * 6 -> 5 -> 6 -> 7 -> 8 -> 9 against ssthresh 5).
+     */
+    void TestPrrChargesRetransmissions() {
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSackOk(true);
+        conn.SetSndBuf(8u << 20);
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 12; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 una = conn.SndUna();
+        const UInt32 end = conn.SndNxt();
+        for (UInt32 i = 0; i < 3; ++i) {
+            now += 1000;
+            DeliverRawAck(conn, now, una, xtcp::core::kFlagAck, true,
+                          una + kMss, una + 2 * kMss);
+        }
+        CHECK(conn.FastRecovery());
+        const UInt32 ssth = conn.Ssthresh();
+        const UInt32 cut = conn.Cwnd();
+        std::fprintf(stderr, "[T4-D] entry ssth=%u cut=%u\n", ssth, cut);
+        // Six partial ACKs, each advancing 1 MSS with a SACK block leaving a
+        // gap: gaps_remain stays true and each ACK drives one retransmission.
+        for (UInt32 k = 1; k <= 6; ++k) {
+            now += 20000;
+            const size_t before = tx.size();
+            DeliverRawAck(conn, now, una + k * kMss, xtcp::core::kFlagAck, true,
+                          una + (k + 1) * kMss, end);
+            std::fprintf(stderr, "[T4-D] partial#%u retx=%zu cwnd=%u ssth=%u\n",
+                         k, tx.size() - before, conn.Cwnd(), conn.Ssthresh());
+        }
+        // RED without the retransmission accounting: 9 vs ssthresh+2 = 7.
+        // With it, every ACK's 1 delivered packet is offset by its 1
+        // retransmitted packet, so the window stays at ssthresh.
+        CHECK(conn.Cwnd() <= conn.Ssthresh() + 2u);
+    }
+
+    /**
+     * @brief D01/review-defect 2: a SACK-confirmed recovery that is NOT undone
+     *        must end with cwnd = ssthresh.
+     *
+     * Kernel tcp_fastretrans_alert part D (tcp_input.c:3012-3018):
+     * tcp_try_undo_recovery returns false (a SACK entry has no undo), then
+     * tcp_end_cwnd_reduction runs; its guard (tcp_input.c:2676-2680) is
+     * `snd_ssthresh < TCP_INFINITE_SSTHRESH && (state == CWR || undo_marker)`.
+     * For a SACK entry `undo_marker` is 0, so the guard must be evaluated on
+     * "the episode was not undone" - the port reused undo_marker_ for that,
+     * and the SACK entry sets it false, so the collapse was skipped
+     * (review_batch1 defect 2: cut=11 ssth=5, exit cwnd stayed 11).
+     */
+    void TestRecoveryExitCollapsesToSsthresh() {
+        EnsureUndoProbeCc();
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSackOk(true);
+        conn.SetSndBuf(4u << 20);
+        CHECK(conn.SetCongestionControl("kcc_test_undo_probe"));
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 10; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 una = conn.SndUna();
+        for (UInt32 i = 0; i < 3; ++i) {
+            now += 1000;
+            DeliverRawAck(conn, now, una, xtcp::core::kFlagAck, true,
+                          una + kMss, una + 2 * kMss);
+        }
+        CHECK(conn.FastRecovery());
+        const UInt32 cwnd_cut = conn.Cwnd();
+        const UInt32 ssth_cut = conn.Ssthresh();
+        CHECK(cwnd_cut > ssth_cut);            // the entry cut, so they differ
+        now += 20000;
+        DeliverRawAck(conn, now, conn.SndNxt());
+        CHECK(!conn.FastRecovery());
+        std::fprintf(stderr, "[d01-collapse] cut=%u ssth=%u exit=%u\n",
+                     cwnd_cut, ssth_cut, conn.Cwnd());
+        CHECK(conn.Cwnd() == ssth_cut);        // red: 11 (stayed at cut)
+    }
+
+    /**
+     * @brief Review-defect 3: a held NON-SACK recovery must undo FIRST.
+     *
+     * Kernel tcp_try_undo_recovery (tcp_input.c:2551-2574) runs
+     * tcp_may_undo -> tcp_undo_cwnd_reduction (restores prior_cwnd) and only
+     * THEN tcp_is_non_sack_preventing_reopen (2572-2573) returns true, which
+     * keeps the state in Recovery and skips tcp_end_cwnd_reduction - so no
+     * CA_EVENT_COMPLETE_CWR on this ACK. The port cleared the marker instead
+     * of undoing (review_batch1 defect 3: undo_calls=0).
+     */
+    void TestNonSackHoldUndoesFirst() {
+        EnsureUndoProbeCc();
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSackOk(false);
+        conn.SetSndBuf(4u << 20);
+        CHECK(conn.SetCongestionControl("kcc_test_undo_probe"));
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 4; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 una = conn.SndUna();
+        const UInt32 end = conn.SndNxt();
+        const UInt32 cwnd_pre = conn.Cwnd();
+        // Zero-window dup-ACKs: the no-SACK entry still arms undo_marker_, but
+        // RetransmitEarliestMissing skips the transmit (RFC 1122 s4.2.2.17,
+        // `0 == snd_wnd_`), so NO retransmission is put on the wire and
+        // undo_retrans stays -1. That is the kernel's "Happy end! We did not
+        // retransmit anything" case (tcp_input.c:2558-2560) where tcp_may_undo
+        // allows the undo. With a real retransmission in flight the kernel's
+        // counter (tcp_output_66.c:3390-3392) makes tcp_may_undo refuse without
+        // TSopt evidence (tcp_input.c:2530-2533) - covered by T2-4.
+        for (UInt32 i = 0; i < 3; ++i) {
+            now += 1000;
+            DeliverRawAck(conn, now, una, xtcp::core::kFlagAck, false, 0, 0, 0);
+        }
+        CHECK(conn.FastRecovery());
+        const UInt32 ssth_cut = conn.Ssthresh();
+        CHECK(cwnd_pre > ssth_cut);
+        g_probeUndoCalls = 0;
+        g_probeCompleteCwr = 0;
+        // ACK exactly at high_seq: held, but the undo MUST have run first.
+        now += 20000;
+        DeliverRawAck(conn, now, end);
+        CHECK(1 <= g_probeUndoCalls);          // red: 0
+        CHECK(conn.FastRecovery());            // still held
+        CHECK(0 == g_probeCompleteCwr);        // no episode end on this ACK
+        CHECK(conn.Cwnd() > ssth_cut);         // window restored (not collapsed)
+        // ACK above high_seq: now the episode ends - but because the window
+        // was already undone, tcp_end_cwnd_reduction must NOT collapse it.
+        {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        now += 20000;
+        DeliverRawAck(conn, now, conn.SndNxt());
+        CHECK(!conn.FastRecovery());
+        CHECK(1 == g_probeCompleteCwr);        // exactly one episode end
+        CHECK(conn.Cwnd() > ssth_cut);         // red: collapsed to ssthresh
+    }
+
+    /**
+     * @brief Review-defect 1: a CA_Loss exit must NOT call
+     *        tcp_end_cwnd_reduction.
+     *
+     * Kernel tcp_process_loss ends with `tcp_try_undo_recovery(sk); return;`
+     * (tcp_input.c:2881-2885) - no tcp_end_cwnd_reduction, hence no
+     * CA_EVENT_COMPLETE_CWR. The port's shared `else` branch fired the event
+     * for Loss too (review_batch1 item 1: complete_cwr=1, kernel 0).
+     */
+    void TestLossExitHasNoCompleteCwr() {
+        EnsureUndoProbeCc();
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSackOk(true);
+        conn.SetSndBuf(4u << 20);
+        CHECK(conn.SetCongestionControl("kcc_test_undo_probe"));
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 4; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 end = conn.SndNxt();
+        // RTO: enters CA_Loss (kernel tcp_enter_loss), no fast recovery.
+        now += 3000000;
+        conn.OnRetransmitTimer(now);
+        CHECK(!conn.FastRecovery());
+        g_probeCompleteCwr = 0;
+        now += 20000;
+        DeliverRawAck(conn, now, end);
+        std::fprintf(stderr, "[d01-loss-exit] complete_cwr=%u\n", g_probeCompleteCwr);
+        CHECK(0 == g_probeCompleteCwr);        // red: 1
+    }
+
+    /**
+     * @brief Review-defect 7: a migration checkpoint must reset the congestion
+     *        view of the TARGET connection.
+     *
+     * The checkpoint carries no congestion state, so every episode/undo field
+     * must be reset to its "no episode" value instead of leaking the target
+     * connection's previous values. Batch 5 (D10) owns the full reset; this
+     * pins the batch-1 fields.
+     */
+    void TestApplyCheckpointResetsCongestionView() {
+        std::vector<xtcp::buf::BufRef> tx_a;
+        xtcp::core::TcpConn src(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx_a](xtcp::buf::BufRef&& p) { tx_a.push_back(std::move(p)); });
+        src.SetPeerMss(kMss);
+        src.SetSackOk(false);
+        src.SetSndBuf(4u << 20);
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 4; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(src.SendData(buf.data(), kMss, now));
+        }
+        now += 3000000;
+        src.OnRetransmitTimer(now);          // rto_pending_ = true, undo_retrans_
+        CHECK(src.RtoPending());
+        const xtcp::core::TcpConn::ConnCheckpoint ck = src.MakeCheckpoint();
+        // The target has its own stale congestion view.
+        std::vector<xtcp::buf::BufRef> tx_b;
+        xtcp::core::TcpConn dst(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 500, 900,
+            [&tx_b](xtcp::buf::BufRef&& p) { tx_b.push_back(std::move(p)); });
+        dst.SetPeerMss(kMss);
+        dst.SetSndBuf(4u << 20);
+        dst.ApplyCheckpoint(ck);
+        CHECK(-1 == dst.UndoRetrans());      // red: leaked a positive value
+        CHECK(!dst.RtoPending());            // red: leaked true
+        CHECK(0u == dst.HighSeq());          // red: leaked the source's high_seq
+    }
+
+    /**
+     * @brief Batch 5 (D10) T5-1: ApplyCheckpoint must reset the WHOLE
+     *        congestion view to "fresh connection, Open state".
+     *
+     * The checkpoint carries no congestion state (no cwnd/ssthresh/ca_state/
+     * prr_*). Batch 1 reset only the episode/undo subset, so the TARGET's
+     * already-cut window survived the restore: a migrated flow kept sending at
+     * the destination's Loss/Recovery window and never restarted from
+     * initcwnd (audit D10).
+     *
+     * Red baseline: cwnd stays at the destination's cut value (2) and
+     * ssthresh at its cut value, instead of 10 / 0x7FFFFFFF.
+     */
+    void TestApplyCheckpointFullReset() {
+        // Source: an ordinary checkpoint (one segment in flight).
+        FsmHarness src;
+        src.Send(kMss);
+        const xtcp::core::TcpConn::ConnCheckpoint ck = src.conn.MakeCheckpoint();
+        CHECK(1 == ck.retrans_queue.size());
+
+        // Destination: its OWN stale recovery episode (Reno entry, no SACK).
+        FsmHarness dst;
+        dst.conn.SetSackOk(false);
+        dst.conn.SetSndBuf(4u << 20);
+        for (UInt32 i = 0; i < 4; ++i) {
+            dst.Send(kMss);
+        }
+        const UInt32 una = dst.conn.SndUna();
+        for (UInt32 i = 0; i < 3; ++i) {
+            dst.now += 1000;
+            dst.Deliver(una);
+        }
+        CHECK(dst.conn.FastRecovery());
+        CHECK(dst.conn.Cwnd() < 10);
+        const UInt32 cwnd_stale = dst.conn.Cwnd();
+        const UInt32 ssth_stale = dst.conn.Ssthresh();
+
+        dst.conn.ApplyCheckpoint(ck);
+        std::fprintf(stderr,
+                     "[T5-1] stale cwnd=%u ssth=%u -> after restore cwnd=%u ssth=%u fr=%d\n",
+                     cwnd_stale, ssth_stale, dst.conn.Cwnd(), dst.conn.Ssthresh(),
+                     dst.conn.FastRecovery() ? 1 : 0);
+        CHECK(10u == dst.conn.Cwnd());             // red: stale cut value
+        CHECK(0x7FFFFFFFu == dst.conn.Ssthresh()); // red: stale cut value
+        CHECK(!dst.conn.FastRecovery());
+        CHECK(0u == dst.conn.HighSeq());
+    }
+
+    /**
+     * @brief Batch 5 (D11) T5-2: RACK must not re-enter Recovery while an RTO
+     *        episode owns the loss verdict (CA_Loss / rto_pending_).
+     *
+     * Kernel tcp_process_loss (tcp_input.c:2845-2896) owns CA_Loss; entering
+     * tcp_enter_recovery there would overwrite prior_cwnd_/prior_ssthresh_
+     * with the ALREADY-CUT window and reset high_seq_ (audit D11).
+     *
+     * Red baseline: the RACK verdict cuts the window a second time
+     * (cwnd 1 -> 2, ssthresh unchanged) and sets fast_recovery_.
+     */
+    void TestRackDoesNotReenterLoss() {
+        FsmHarness h;
+        h.conn.SetSackOk(true);
+        h.conn.SetSndBuf(4u << 20);
+        for (UInt32 i = 0; i < 4; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        // RTO: CA_Loss, rto_pending_ = true, cwnd cut to 1 (Reno path).
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        CHECK(h.conn.RtoPending());
+        const UInt32 cwnd_rto = h.conn.Cwnd();
+        const UInt32 ssth_rto = h.conn.Ssthresh();
+        CHECK(1u == cwnd_rto);
+        CHECK(2u == ssth_rto);
+
+        // Dup-ACK whose SACK block delivers segment 3: RACK anchors on it and
+        // segment 2 (sent before the RTO) is overdue -> a loss verdict.
+        h.now += 20000;
+        h.Deliver(una, xtcp::core::kFlagAck, 65535, true,
+                  una + 2 * kMss, una + 3 * kMss);
+        std::fprintf(stderr,
+                     "[T5-2] after RTO cwnd=%u ssth=%u -> after RACK cwnd=%u ssth=%u fr=%d\n",
+                     cwnd_rto, ssth_rto, h.conn.Cwnd(), h.conn.Ssthresh(),
+                     h.conn.FastRecovery() ? 1 : 0);
+        CHECK(!h.conn.FastRecovery());       // red: RACK entered Recovery
+        CHECK(cwnd_rto == h.conn.Cwnd());    // red: cut again to ssthresh
+        CHECK(ssth_rto == h.conn.Ssthresh());
+    }
+
+    /**
+     * @brief Batch 5 (D11) T5-3: the RTO snapshot survives a RACK verdict.
+     *
+     * T5-2 blocks the RACK entry outright; this test pins the OUTCOME the
+     * first-save gate protects: the spurious-RTO undo must restore the window
+     * the RTO saved, never the value RACK would have captured after the cut.
+     * (The first-save gate at the RACK capture is the symmetric guard of the
+     * RTO one at tcp_fsm.cpp:1764.)
+     *
+     * Red baseline: RACK re-entry clears rto_pending_/retrans_stamp_ts_, so
+     * the Eifel adjudication never runs and the window stays cut.
+     */
+    void TestRackKeepsRtoSnapshot() {
+        EnsureRecorderCc();   // owns cwnd growth so only the undo changes it
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kSynSent, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSndBuf(4u << 20);
+        conn.SetSackOk(true);
+        xtcp::core::TimePoint now = 1000;
+        conn.SendSyn();
+        const UInt32 our_syn_ts = TsvalOf(tx.back());
+        const std::vector<Byte> synack = BuildSegTs(
+            443, 40000, 500, 101,
+            static_cast<UInt16>(xtcp::core::kFlagSyn | xtcp::core::kFlagAck), 65535,
+            777, our_syn_ts, false, 0, 0, true);
+        conn.OnSegment(synack.data(), static_cast<UInt32>(synack.size()), now);
+        CHECK(xtcp::core::TcpState::kEstablished == conn.State());
+        CHECK(conn.SetCongestionControl("kcc_test_rec"));
+
+        // Grow the window (Reno) so the RTO's pre-cut value is distinctive.
+        for (UInt32 r = 0; r < 8; ++r) {
+            const UInt32 cwnd = conn.Cwnd();
+            for (UInt32 i = 0; i < cwnd; ++i) {
+                std::vector<Byte> buf(kMss, 0x41);
+                CHECK(conn.SendData(buf.data(), kMss, now));
+            }
+            now += 20000;
+            const std::vector<Byte> a = BuildSegTs(
+                40000, 443, 201, conn.SndNxt(), xtcp::core::kFlagAck, 65535,
+                0, 0);
+            conn.OnSegment(a.data(), static_cast<UInt32>(a.size()), now);
+        }
+        const UInt32 cwnd_pre = conn.Cwnd();
+        CHECK(8 < cwnd_pre);
+
+        for (UInt32 i = 0; i < 3; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 una = conn.SndUna();
+        // RTO: prior_cwnd_ = cwnd_pre, cwnd cut to 1.
+        now += 3000000;
+        conn.OnRetransmitTimer(now);
+        CHECK(conn.RtoPending());
+        CHECK(1u == conn.Cwnd());
+
+        // RACK verdict attempt: deliver segment 3, leave segment 2 overdue.
+        now += 20000;
+        const std::vector<Byte> dup = BuildSegTs(
+            40000, 443, 201, una, xtcp::core::kFlagAck, 65535, 0, 0, true,
+            una + 2 * kMss, una + 3 * kMss);
+        conn.OnSegment(dup.data(), static_cast<UInt32>(dup.size()), now);
+
+        // ACK covering the whole flight (the retransmitted range included),
+        // echoing a TSval OLDER than the RTO's -> spurious RTO -> Eifel undo
+        // restores prior_cwnd_. The queue empties here, so no RACK verdict can
+        // fire on this ACK and mask the restored window.
+        now += 20000;
+        const std::vector<Byte> a = BuildSegTs(
+            40000, 443, 201, conn.SndNxt(), xtcp::core::kFlagAck, 65535, 888, 1);
+        conn.OnSegment(a.data(), static_cast<UInt32>(a.size()), now);
+        std::fprintf(stderr, "[T5-3] pre=%u rto_cwnd=1 -> after undo cwnd=%u fr=%d\n",
+                     cwnd_pre, conn.Cwnd(), conn.FastRecovery() ? 1 : 0);
+        CHECK(!conn.RtoPending());
+        CHECK(cwnd_pre == conn.Cwnd());   // red: snapshot clobbered by RACK
+        CHECK(!conn.FastRecovery());
+    }
+
+    /**
+     * @brief Batch 5 addendum (A): ApplyCheckpoint's cc_ops_->init must fully
+     *        reset the PLUGIN's private recovery state.
+     *
+     * KccInit (cc_kcc.cpp:770-789) only resets mode/gains/p_est/idle/drain/
+     * next_rtt/rand/min_rtt/snd_cwnd. The rest of KccState (prev_ca_state,
+     * packet_conservation, full_bw, total_delivered, max_bw, cycle_idx, ...)
+     * is left untouched, and ApplyCheckpoint does not drop ca_priv, so init
+     * REUSES the same KccState: the destination shard's old recovery epoch
+     * survives the migration (audit A).
+     *
+     * The connection runs the real KCC plugin through a thin forwarding wrapper
+     * so the test can capture the XtcpConnCc* and read the private state with
+     * the read-only KccGetSnapshot probe.
+     */
+    const xtcp::cc::XtcpCongestionOps* g_b5KccInner = NULLPTR;
+    XtcpConnCc* g_b5KccSk = NULLPTR;
+
+    void B5KccWrapInit(XtcpConnCc* sk) noexcept {
+        g_b5KccSk = sk;
+        if (NULLPTR != g_b5KccInner && NULLPTR != g_b5KccInner->init) {
+            g_b5KccInner->init(sk);
+        }
+    }
+    void B5KccWrapRelease(XtcpConnCc* sk) noexcept {
+        if (NULLPTR != g_b5KccInner && NULLPTR != g_b5KccInner->release) {
+            g_b5KccInner->release(sk);
+        }
+    }
+    UInt32 B5KccWrapSsthresh(XtcpConnCc* sk) noexcept {
+        return (NULLPTR != g_b5KccInner && NULLPTR != g_b5KccInner->ssthresh)
+            ? g_b5KccInner->ssthresh(sk) : sk->snd_ssthresh;
+    }
+    void B5KccWrapSetState(XtcpConnCc* sk, Byte s) noexcept {
+        if (NULLPTR != g_b5KccInner && NULLPTR != g_b5KccInner->set_state) {
+            g_b5KccInner->set_state(sk, s);
+        }
+    }
+    void B5KccWrapEvent(XtcpConnCc* sk, xtcp::cc::CaEvent ev) noexcept {
+        if (NULLPTR != g_b5KccInner && NULLPTR != g_b5KccInner->cwnd_event) {
+            g_b5KccInner->cwnd_event(sk, ev);
+        }
+    }
+    UInt32 B5KccWrapUndo(XtcpConnCc* sk) noexcept {
+        return (NULLPTR != g_b5KccInner && NULLPTR != g_b5KccInner->undo_cwnd)
+            ? g_b5KccInner->undo_cwnd(sk) : sk->snd_cwnd;
+    }
+    void B5KccWrapControl(XtcpConnCc* sk, const RateSample* rs) noexcept {
+        if (NULLPTR != g_b5KccInner && NULLPTR != g_b5KccInner->cong_control) {
+            g_b5KccInner->cong_control(sk, rs);
+        }
+    }
+
+    void EnsureB5KccWrapper() {
+        static bool registered = false;
+        xtcp::cc::RegisterKcc();
+        g_b5KccInner = xtcp::cc::FindCongestionControl("kcc");
+        CHECK(NULLPTR != g_b5KccInner);
+        if (registered) {
+            return;
+        }
+        XtcpCongestionOps ops;
+        ops.name = "b5_kcc_wrap";
+        ops.init = B5KccWrapInit;
+        ops.release = B5KccWrapRelease;
+        ops.ssthresh = B5KccWrapSsthresh;
+        ops.set_state = B5KccWrapSetState;
+        ops.cwnd_event = B5KccWrapEvent;
+        ops.undo_cwnd = B5KccWrapUndo;
+        ops.cong_control = B5KccWrapControl;
+        CHECK(xtcp::cc::RegisterCongestionControl(ops));
+        registered = true;
+    }
+
+    void TestMigrationResetsKccRecoveryState() {
+        EnsureB5KccWrapper();
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSndBuf(4u << 20);
+        conn.SetSackOk(true);
+        CHECK(conn.SetCongestionControl("b5_kcc_wrap"));
+        CHECK(NULLPTR != g_b5KccSk);
+        xtcp::core::TimePoint now = 1000;
+        // Warm-up: ACK-clocked rounds so KCC's estimator accumulates
+        // total_delivered / max_bw / full_bw.
+        for (UInt32 r = 0; r < 8; ++r) {
+            const UInt32 cwnd = conn.Cwnd();
+            for (UInt32 i = 0; i < cwnd; ++i) {
+                std::vector<Byte> buf(kMss, 0x41);
+                CHECK(conn.SendData(buf.data(), kMss, now));
+            }
+            now += 20000;
+            DeliverRawAck(conn, now, conn.SndNxt());
+        }
+        // Enter Recovery, then one advancing ACK: KCC latches
+        // packet_conservation=1 and prev_ca_state=3.
+        for (UInt32 i = 0; i < 6; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 una = conn.SndUna();
+        for (UInt32 i = 0; i < 3; ++i) {
+            now += 1000;
+            DeliverRawAck(conn, now, una);
+        }
+        CHECK(conn.FastRecovery());
+        now += 1000;
+        DeliverRawAck(conn, now, una + kMss);
+
+        KccSnapshot before;
+        CHECK(xtcp::cc::KccGetSnapshot(g_b5KccSk, &before));
+        std::fprintf(stderr,
+                     "[A] pre-migration kcc: prev_ca=%u cons=%u full_bw=%llu "
+                     "total_delivered=%llu max_bw=%llu\n",
+                     before.prev_ca_state, before.packet_conservation,
+                     static_cast<unsigned long long>(before.full_bw),
+                     static_cast<unsigned long long>(before.total_delivered),
+                     static_cast<unsigned long long>(before.max_bw));
+        CHECK(1u == before.packet_conservation);   // the epoch really is live
+        CHECK(0u != before.prev_ca_state);
+
+        // Ordinary checkpoint from a plain source connection.
+        FsmHarness src;
+        src.Send(kMss);
+        const xtcp::core::TcpConn::ConnCheckpoint ck = src.conn.MakeCheckpoint();
+        conn.ApplyCheckpoint(ck);
+
+        KccSnapshot after;
+        CHECK(xtcp::cc::KccGetSnapshot(g_b5KccSk, &after));
+        std::fprintf(stderr,
+                     "[A] post-migration kcc: prev_ca=%u cons=%u full_bw=%llu "
+                     "total_delivered=%llu max_bw=%llu\n",
+                     after.prev_ca_state, after.packet_conservation,
+                     static_cast<unsigned long long>(after.full_bw),
+                     static_cast<unsigned long long>(after.total_delivered),
+                     static_cast<unsigned long long>(after.max_bw));
+        CHECK(0u == after.packet_conservation);    // red: stale 1
+        CHECK(0u == after.prev_ca_state);          // red: stale 3
+        CHECK(0ull == after.full_bw);              // red: stale estimate
+        CHECK(0ull == after.total_delivered);      // red: stale epoch
+        CHECK(0ull == after.max_bw);               // red: stale estimate
     }
 
     /**
@@ -1723,6 +3121,27 @@ namespace {
         rs.prior_in_flight_bytes = target + kMss;
         d.sk.inflight = target + kMss;
         CHECK(1u == xtcp::cc::KccTestIsNextCyclePhase(&d.sk, &rs, after_full_length));
+
+        // (d) B8-D3: the pre-ACK in-flight must also be adjusted by the
+        // pacing-queue EDT credit. One segment below the probe-up target,
+        // the credit-free path (plus the one-segment gain headroom) reaches
+        // the target and ends the phase; exactly one credited segment pushes
+        // it back below the target, so the phase must NOT end. Forcing the
+        // edt_us argument to 0 (the old wiring-removal mutant) flips the
+        // second row to 1 and fails here.
+        CHECK(target > kMss);
+        CHECK(target - kMss <= 0xFFFFFFFFull);
+        rs.lost = 0;
+        rs.prior_in_flight_bytes = static_cast<UInt32>(target - kMss);
+        rs.pacing_edt_us = 0;
+        CHECK(1u == xtcp::cc::KccTestIsNextCyclePhase(&d.sk, &rs, after_full_length));
+        const UInt64 credit_us =
+            ((UInt64(1) << 24) + probe.max_bw - 1) / probe.max_bw;
+        CHECK(0 < credit_us);
+        CHECK(credit_us <= 0xFFFFFFFFull);
+        CHECK(1u == ((probe.max_bw * credit_us) >> 24));   // exactly 1 packet
+        rs.pacing_edt_us = static_cast<UInt32>(credit_us);
+        CHECK(0u == xtcp::cc::KccTestIsNextCyclePhase(&d.sk, &rs, after_full_length));
     }
 
     void TestKccFsmTfoRequeue() {
@@ -1958,13 +3377,20 @@ namespace {
         for (UInt32 i = 0; i < 10; ++i) {
             d.Round(20000);
         }
-        // Enter Recovery (kernel CA_Recovery = 3).
+        // Enter Recovery (kernel CA_Recovery = 3). The transition sample
+        // latches conservation; the NEXT delivered round is a round_start and
+        // kernel kcc_update_bw (tcp_kcc.c:4336) clears it. Staying at 1 for the
+        // whole episode would freeze the window (audit B8-D1).
         d.SetPriorCwnd(d.sk.snd_cwnd);
         d.SetCaState(3);
-        for (UInt32 i = 0; i < 20; ++i) {
+        d.Round(20000);
+        CheckFullSnapshot(d);
+        CHECK(1u == d.Snap().packet_conservation);   // latched on transition
+        CHECK(kcc_core_cwnd_segs(&d.ref) == static_cast<s64>(d.sk.snd_cwnd));
+        for (UInt32 i = 1; i < 20; ++i) {
             d.Round(20000);
             CheckFullSnapshot(d);
-            CHECK(1u == d.Snap().packet_conservation);   // conservation latched
+            CHECK(0u == d.Snap().packet_conservation);   // cleared by round_start
             CHECK(kcc_core_cwnd_segs(&d.ref) == static_cast<s64>(d.sk.snd_cwnd));
         }
         // Back to Open: cwnd = max(cwnd, prior_cwnd), conservation cleared.
@@ -1982,16 +3408,57 @@ namespace {
             CheckFullSnapshot(d);
             CHECK(kcc_core_cwnd_segs(&d.ref) == static_cast<s64>(d.sk.snd_cwnd));
         }
+
+        // B8-D4: kernel kcc_set_cwnd_to_recover_or_restore restores
+        // cwnd = max(cwnd, prior_cwnd) on Recovery -> Open
+        // (tcp_kcc.c:4007-4009). In the scenario above prior_cwnd equals the
+        // current window, so the branch body never fires. Use a short history
+        // that leaves full_bw_reached == 0: the post-restore additive branch
+        // then only grows when cwnd < target, so pinning prior_cwnd AT the
+        // BDP target makes the restored value survive untouched and the
+        // assertion observes the branch body itself.
+        {
+            Driver r(0, 0, 2);
+            r.Round(20000);              // sample 1: STARTUP, full_bw armed
+            r.SetCaState(3);
+            r.Round(20000);              // sample 2: Open -> Recovery entry
+            const KccSnapshot pre = r.Snap();
+            CHECK(0 == pre.mode);        // still STARTUP
+            CHECK(0u == pre.full_bw_reached);
+            CHECK(1u == pre.packet_conservation);
+            CHECK(3u == pre.prev_ca_state);
+            const UInt64 restore_target =
+                kcc_bdp_packets(pre.max_bw, pre.min_rtt_us, pre.cwnd_gain);
+            CHECK(6 < restore_target);
+            CHECK(restore_target <= 0xFFFFFFFFull);
+            r.sk.snd_cwnd = 6;
+            r.ref.cwnd_segs = 6;
+            r.ref.congestion_window_bytes = 6 * kMss;
+            r.SetPriorCwnd(static_cast<UInt32>(restore_target));
+            r.SetCaState(0);
+            r.Round(20000);              // sample 3: Recovery -> Open restore
+            CHECK(static_cast<UInt32>(restore_target) == r.sk.snd_cwnd);
+            CheckFullSnapshot(r);
+            CHECK(0u == r.Snap().packet_conservation);
+            CHECK(kcc_core_cwnd_segs(&r.ref) == static_cast<s64>(r.sk.snd_cwnd));
+        }
         CHECK(0u == g_failures);
     }
 
     void TestKccDifferentialNewFields() {
         Driver d(0, 0, 2);
+        // B8-D3: keep ONE segment in flight. With the old 20-segment pipe a
+        // pacing-queue credit of at most one packet could never move any
+        // decision, so the EDT wiring had zero falsifiable coverage.
+        d.flight = kMss;
         UInt32 seed = 0x12345678;
         const auto next = [&seed]() -> UInt32 {
             seed = seed * 1664525u + 1013904223u;
             return seed;
         };
+        // Zero / minimal / partial / full credit rows (edt_us is the pacing
+        // queue depth fed to both the port and the reference core).
+        static const UInt32 kEdtGrid[] = {0, 1, 2, 3, 4000};
         for (UInt32 i = 0; i < 3000; ++i) {
             UInt32 rtt_us = 20000 + (i % 1000) * 3 + (next() % 2000);
             if (i < 200) {
@@ -2012,9 +3479,7 @@ namespace {
             }
             const bool delayed = (0 == (i % 11));
             const bool app = (0 == (i % 17));
-            // EDT credit coverage: a third of the samples carry a pacing-queue
-            // depth, and it spans the zero-credit / partial / full-credit rows.
-            d.edt_us = (0 == (i % 3)) ? (next() % 4000) : 0;
+            d.edt_us = kEdtGrid[i % (sizeof(kEdtGrid) / sizeof(kEdtGrid[0]))];
             d.Ack(rtt_us, interval_us, delivered, lost, prior, delayed, app);
             CheckFullSnapshot(d);
             CHECK(kcc_core_cwnd_segs(&d.ref) == static_cast<s64>(d.sk.snd_cwnd));
@@ -2025,8 +3490,337 @@ namespace {
             }
         }
     }
-}
 
+    /**
+     * @brief B8-D5: the jitter EWMA must be evaluated in 64 bits.
+     *
+     * Kernel tcp_kcc.c:4500-4503 widens the product to (u64) before the
+     * division; the port/oracle used 32-bit arithmetic, so
+     * jitter_ewma*7 + raw_jitter wrapped once jitter_ewma >= 613,566,582
+     * (min_rtt >= ~613.6 s is reachable: RTT samples are capped at 3600 s).
+     *
+     * A long RTT seed plus one low sample drives x_est near 1 s while the
+     * min_rtt confirmation gates keep min_rtt at 700 s; every following
+     * 700 s sample then contributes raw_jitter ~= 699,000,000 us. The
+     * expected value is recomputed here with the u64 formula from the
+     * OBSERVED pre-ACK x_est, so a 32-bit wrap shows up as a mismatch.
+     */
+    void TestKccJitterEwmaWideMul() {
+        Driver d(700000000u, 0, 2);
+        const auto step = [&d](UInt32 rtt_us) {
+            const KccSnapshot before = d.Snap();
+            const UInt64 x_us = before.x_est >> 10;
+            UInt64 raw = (rtt_us > x_us) ? (rtt_us - x_us) : (x_us - rtt_us);
+            if (0xFFFFFFFFull < raw) {
+                raw = 0xFFFFFFFFull;
+            }
+            d.Round(rtt_us);
+            const KccSnapshot after = d.Snap();
+            UInt64 want;
+            if (0 == before.sample_cnt) {
+                want = rtt_us >> 2;                  // kJitterSeedShift
+                if (0 == want) {
+                    want = 1;
+                }
+            } else if (1 == before.sample_cnt) {
+                want = raw;
+            } else {
+                want = (static_cast<UInt64>(before.jitter_ewma) * 7u + raw) / 8u;
+            }
+            const UInt64 cap =
+                (before.min_rtt_us > 500000u) ? before.min_rtt_us : 500000u;
+            if (cap < want) {
+                want = cap;
+            }
+            CHECK(after.jitter_ewma == want);
+            CHECK(d.ref.jitter_ewma == after.jitter_ewma);
+        };
+        step(700000000u);       // seed: jitter = rtt >> 2 = 175,000,000
+        step(1000000u);         // x_est collapses to 1 s (raw ~= 699,000,000)
+        for (UInt32 i = 0; i < 25; ++i) {
+            step(700000000u);
+        }
+        const KccSnapshot s = d.Snap();
+        CHECK(600000000u < s.jitter_ewma);   // 32-bit path stays below ~537M
+    }
+
+    /**
+     * @brief B8-D6: the reference core must not divide by zero when a test
+     *        harness leaves ref.mss unset (the port guards with mss > 0).
+     */
+    void TestKccOracleZeroMss() {
+        kcc_core ref;
+        kcc_core_init(&ref);
+        ref.mss = 0;
+        ref.min_rtt_us = 20000;
+        ref.has_seen_rtt = 0;
+        kcc_core_on_ack_pkts(&ref, 20000, 1, 20000, kMss, kMss, 0, 0, 1, 0, 0, 0);
+        CHECK(0 < kcc_core_cwnd_segs(&ref));
+        CHECK(0 < kcc_core_pacing_rate(&ref));
+        CHECK(0 == ref.has_seen_rtt);   // boot-rate path skipped, like the port
+    }
+
+    // ---- Batch 7: app_limited / delivered accounting ----
+
+    /**
+     * @brief A1: kernel tcp_rate_check_app_limited cond3 compares
+     *        tcp_packets_in_flight with snd_cwnd (tcp_rate_66.c:203), and the
+     *        marker itself is `tp->delivered + tcp_packets_in_flight`
+     *        (tcp_rate_66.c:205-206) in the PACKET domain. A TSO segment
+     *        (3 MSS in one skb, pkt_count 3) must contribute 3 packets, not
+     *        4380 bytes, and cond3 must read 3 < cwnd.
+     */
+    void TestB7A1AppLimitedCond3Packets() {
+        FsmHarness h;
+        h.Warm();                       // delivered_pkts = 1
+        h.conn.SetSndBuf(1u << 20);
+        h.conn.SetTsoTx(true);
+        // One 3-packet super-segment on an otherwise idle pipe.
+        h.Send(3 * kMss);
+        CHECK(1 == h.conn.RetransQueueSize());   // TSO direct: one skb
+        // A one-byte send runs MaybeMarkAppLimited with inflight = 4380 B
+        // = 3 packets. cond3 (3 < 10) holds, so the marker latches at
+        // delivered_pkts + 3 = 4. A byte-domain cond3 would read 4380 and
+        // refuse to latch (0), and a byte-domain marker would be 4381.
+        h.Send(1);
+        const UInt32 marker = h.conn.AppLimitedMarker();
+        const UInt64 delivered = h.conn.DeliveredPkts();
+        std::fprintf(stderr, "[B7A1] marker=%u delivered=%llu lost=%u retx=%u\n",
+                     marker, static_cast<unsigned long long>(delivered),
+                     h.conn.LostOutPkts(), h.conn.RetransOutPkts());
+        CHECK(0 != marker);                               // cond3 latched
+        CHECK(static_cast<UInt32>(delivered) + 3 == marker);  // packet domain
+    }
+
+    /**
+     * @brief A2/A3: kernel tcp_rate_gen clears app_limited on EVERY ACK
+     *        (tcp_rate_66.c:123-125), a SACK-only dup-ACK included. A3 is
+     *        the symptom: the marker must be gone BEFORE the next segment's
+     *        send-time snapshot (tcp_rate_66.c:69), so its rate sample must
+     *        report is_app_limited = 0.
+     */
+    void TestB7A2MarkerClearedOnEveryAck() {
+        FsmHarness h;
+        h.Warm();                       // delivered_pkts = 1, marker cleared
+        // One segment on an idle pipe: cond3 (0 < cwnd) holds, so the marker
+        // latches at delivered_pkts + 0 = 1.
+        h.Send(kMss);
+        const UInt32 una = h.conn.SndUna();
+        const UInt32 marker = h.conn.AppLimitedMarker();
+        std::fprintf(stderr, "[B7A2] marker=%u una=%u end=%u\n", marker, una,
+                     h.conn.SndNxt());
+        CHECK(1u == marker);
+        // SACK-only dup-ACK covering that segment: delivered_pkts 1 -> 2
+        // passes the marker, so the kernel clears it on THIS ACK (no
+        // cumulative advance involved).
+        h.now += 20000;
+        h.Deliver(una, xtcp::core::kFlagAck, 65535, true, una, una + kMss);
+        std::fprintf(stderr, "[B7A2] after SACK-only: marker=%u delivered=%llu\n",
+                     h.conn.AppLimitedMarker(),
+                     static_cast<unsigned long long>(h.conn.DeliveredPkts()));
+        CHECK(2ull == h.conn.DeliveredPkts());
+        CHECK(0 == h.conn.AppLimitedMarker());   // red: still latched
+
+        // A3: the RTO retransmit of that (SACKed but un-ACKed) segment takes
+        // its is_app_limited snapshot now; the ACK that pops it reports it.
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        g_recCalls = 0;
+        g_recLast = RateSample();
+        h.now += 20000;
+        h.Deliver(h.conn.SndNxt());
+        std::fprintf(stderr, "[B7A2] popped sample is_app_limited=%u\n",
+                     g_recLast.is_app_limited);
+        CHECK(1 <= g_recCalls);
+        CHECK(0u == g_recLast.is_app_limited);   // red: 1 (stale marker)
+    }
+    /**
+     * @brief A4: kernel tcp_sacktag_one drops a LOST segment from lost_out
+     *        when the SACK block fully covers it (tcp_input_66.c:1414-1417;
+     *        the retransmitted variant at :1392-1396 clears both LOST and
+     *        SACKED_RETRANS). The port only decremented lost_out_pkts_ when
+     *        the segment was popped, so a SACKed loss stayed counted forever
+     *        and app_limited cond4 (lost_out <= retrans_out) never held.
+     */
+    void TestB7A4SackClearsLostOut() {
+        FsmHarness h;
+        h.Warm();
+        h.conn.SetSndBuf(1u << 20);
+        for (UInt32 i = 0; i < 4; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        // RTO marks the head lost (kernel tcp_timeout_mark_lost) and
+        // retransmits it.
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        std::fprintf(stderr, "[B7A4] after RTO lost_out=%u retrans_out=%u\n",
+                     h.conn.LostOutPkts(), h.conn.RetransOutPkts());
+        CHECK(1 == h.conn.LostOutPkts());
+        // The peer SACKs the retransmitted head completely: the kernel
+        // removes it from lost_out (and from retrans_out).
+        h.now += 20000;
+        h.Deliver(una, xtcp::core::kFlagAck, 65535, true, una, una + kMss);
+        std::fprintf(stderr, "[B7A4] after SACK: lost_out=%u retrans_out=%u\n",
+                     h.conn.LostOutPkts(), h.conn.RetransOutPkts());
+        CHECK(0 == h.conn.LostOutPkts());   // red: still 1
+        // cond4 of tcp_rate_check_app_limited must be satisfiable again.
+        CHECK(h.conn.LostOutPkts() <= h.conn.RetransOutPkts());
+    }
+    /**
+     * @brief B1: an EMPTY DSACK block (start == end) must be rejected
+     *        before any accounting (tcp_input_66.c:1011-1012
+     *        `if (!before(start_seq, end_seq)) return 0;`). The port counted
+     *        dup_segs = 1 for it.
+     */
+    void TestB7B1EmptyDsackIgnored() {
+        FsmHarness h;
+        h.Warm();                     // delivered_pkts = 1
+        h.Send(kMss);
+        h.Send(kMss);
+        const UInt32 una = h.conn.SndUna();
+        // A retransmission is required for the DSACK to be credible at all.
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        h.now += 20000;
+        h.Deliver(una + kMss);        // cum-ACK the retransmitted head
+        const UInt64 before = h.conn.DeliveredPkts();
+        const UInt32 dups_before = h.conn.DsackDups();
+        h.now += 20000;
+        // Empty block at the frontier: seq_len == 0.
+        h.Deliver(una + kMss, xtcp::core::kFlagAck, 65535, true,
+                  una + kMss, una + kMss);
+        std::fprintf(stderr, "[B7B1] delivered %llu -> %llu dups %u -> %u\n",
+                     static_cast<unsigned long long>(before),
+                     static_cast<unsigned long long>(h.conn.DeliveredPkts()),
+                     dups_before, h.conn.DsackDups());
+        CHECK(before == h.conn.DeliveredPkts());   // red: +1
+        CHECK(dups_before == h.conn.DsackDups());  // red: +1
+    }
+
+    /**
+     * @brief B2: a REVERSED block (right < left) must be rejected before it
+     *        can poison dsack_dups_ (tcp_input_66.c:1011 before() runs
+     *        first). The port accumulated the dups first and filtered after,
+     *        so a later LEGITIMATE DSACK was gated out.
+     */
+    void TestB7B2ReversedBlockDoesNotPoisonGate() {
+        FsmHarness h;
+        h.Warm();
+        h.Send(kMss);
+        h.Send(kMss);
+        const UInt32 una = h.conn.SndUna();
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);   // total_retrans = 1
+        h.now += 20000;
+        h.Deliver(una + kMss);             // cum-ACK the retransmitted head
+        const UInt64 base = h.conn.DeliveredPkts();
+        const UInt32 dups = h.conn.DsackDups();
+        // Reversed block: sr < sl. Must be ignored entirely.
+        h.now += 20000;
+        h.Deliver(una + kMss, xtcp::core::kFlagAck, 65535, true,
+                  una + kMss, una);
+        std::fprintf(stderr, "[B7B2] after reversed: dups=%u delivered=%llu\n",
+                     h.conn.DsackDups(),
+                     static_cast<unsigned long long>(h.conn.DeliveredPkts()));
+        CHECK(dups == h.conn.DsackDups());          // red: +1 poisoned
+        CHECK(base == h.conn.DeliveredPkts());
+        // A genuine DSACK for the retransmitted head must still be credited.
+        h.now += 20000;
+        h.Deliver(una + kMss, xtcp::core::kFlagAck, 65535, true,
+                  una, una + kMss);
+        std::fprintf(stderr, "[B7B2] after genuine DSACK: delivered=%llu (expect %llu)\n",
+                     static_cast<unsigned long long>(h.conn.DeliveredPkts()),
+                     static_cast<unsigned long long>(base + 1));
+        CHECK(base + 1 == h.conn.DeliveredPkts());  // red: gate poisoned
+    }
+
+    /**
+     * @brief B3: a DSACK block longer than tp->max_window is dubious and
+     *        must be rejected (tcp_input_66.c:1015-1017). tp->max_window is
+     *        the largest receive window the peer ever advertised
+     *        (tcp_input_66.c:6409 at the handshake, :3596-3597 afterwards),
+     *        so a real handshake advertising 300 bytes pins it to 300.
+     *
+     * The block is 400 bytes: longer than max_window (the kernel rejects it)
+     * yet a single segment (dup_segs = 1), so the old code - which had no
+     * max_window test - credited +1 because its event-domain gate
+     * (dsack_dups 1 <= retransmit_count_ 1) happened to pass.
+     */
+    void TestB7B3OversizedDsackRejected() {
+        FsmHarness h(xtcp::core::TcpState::kSynSent);
+        // Handshake advertising a 300-byte window with no window scale, so
+        // snd_wnd_ = max_window_ = 300 (tcp_input_66.c:6409).
+        h.Deliver(101, static_cast<UInt16>(xtcp::core::kFlagSyn | xtcp::core::kFlagAck),
+                  300, false, 0, 0, 200);
+        CHECK(xtcp::core::TcpState::kEstablished == h.conn.State());
+        CHECK(300 == h.conn.SndWnd());
+        // One window-limited segment, then an RTO retransmits it: one
+        // retransmission event, one packet.
+        h.Send(300);
+        CHECK(1 == h.conn.RetransQueueSize());
+        const UInt32 una = h.conn.SndUna();
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        std::fprintf(stderr, "[B7B3] events=%u total_retrans_pkts=%u snd_wnd=%u\n",
+                     h.conn.RetransmitCount(), h.conn.TotalRetransPkts(),
+                     h.conn.SndWnd());
+        CHECK(1 == h.conn.RetransmitCount());
+        h.now += 20000;
+        // Every ACK keeps advertising the same 300-byte window, so
+        // tp->max_window stays 300 (a 65535 ACK would legitimately grow it).
+        h.Deliver(una + 300, xtcp::core::kFlagAck, 300);
+        const UInt64 base = h.conn.DeliveredPkts();
+        const UInt32 dups = h.conn.DsackDups();
+        // 400-byte block ending at the frontier: seq_len 400 > max_window
+        // 300 -> dubious, rejected BEFORE dsack_dups moves.
+        h.now += 20000;
+        h.Deliver(una + 300, xtcp::core::kFlagAck, 300, true,
+                  una + 300 - 400, una + 300);
+        std::fprintf(stderr, "[B7B3] delivered %llu -> %llu dups %u -> %u\n",
+                     static_cast<unsigned long long>(base),
+                     static_cast<unsigned long long>(h.conn.DeliveredPkts()),
+                     dups, h.conn.DsackDups());
+        CHECK(base == h.conn.DeliveredPkts());   // red: +1
+        CHECK(dups == h.conn.DsackDups());       // no counter movement
+    }
+    /**
+     * @brief B4: the DSACK credibility gate compares dsack_dups against
+     *        tp->total_retrans in the PACKET domain (tcp_output_66.c:3325
+     *        `tp->total_retrans += segs`). One TSO retransmission of a
+     *        3-packet super-segment is THREE packets, so a 2-segment DSACK
+     *        is credible; the event counter (1) wrongly rejected it.
+     */
+    void TestB7B4DsackGateUsesPacketDomain() {
+        FsmHarness h;
+        h.Warm();
+        h.conn.SetSndBuf(1u << 20);
+        h.conn.SetTsoTx(true);
+        // One 3-packet TSO segment: a single retransmission event, three
+        // retransmitted packets.
+        h.Send(3 * kMss);
+        CHECK(1 == h.conn.RetransQueueSize());
+        const UInt32 una = h.conn.SndUna();
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        std::fprintf(stderr, "[B7B4] events=%u total_retrans_pkts=%u\n",
+                     h.conn.RetransmitCount(), h.conn.TotalRetransPkts());
+        CHECK(1 == h.conn.RetransmitCount());
+        CHECK(3 == h.conn.TotalRetransPkts());   // red: 0 (field not maintained)
+        h.now += 20000;
+        h.Deliver(una + 3 * kMss);
+        const UInt64 base = h.conn.DeliveredPkts();
+        // A 2-segment DSACK: dup_segs = 2 <= total_retrans (3 packets) ->
+        // the kernel accepts it. The event count (1) would reject it.
+        h.now += 20000;
+        h.Deliver(una + 3 * kMss, xtcp::core::kFlagAck, 65535, true,
+                  una, una + 2 * kMss);
+        std::fprintf(stderr, "[B7B4] delivered %llu -> %llu (expect +2)\n",
+                     static_cast<unsigned long long>(base),
+                     static_cast<unsigned long long>(h.conn.DeliveredPkts()));
+        CHECK(base + 2 == h.conn.DeliveredPkts());   // red: +0 (event gate)
+    }
+}
 int main() {
     xtcp::buf::InitPools();
     xtcp::cc::KccTestSetRandomSeed(2);
@@ -2070,6 +3864,20 @@ int main() {
     TestKccFsmTxStartAndAppLimited();
     TestKccFsmCwndStaysLegal();
     TestKccFsmCaStateReturnsToOpen();
+    TestNonSackRecoveryHoldsAtHighSeq();
+    TestKccRecoveryExitKeepsPriorCwnd();
+    TestKccRecoveryExitKeepsCcWindow();
+    TestExitAckDoesNotBurst();
+    TestRecoveryExitCollapsesToSsthresh();
+    TestPrrStaysInPackets();
+    TestPrrChargesRetransmissions();
+    TestNonSackHoldUndoesFirst();
+    TestLossExitHasNoCompleteCwr();
+    TestApplyCheckpointResetsCongestionView();
+    TestApplyCheckpointFullReset();
+    TestRackDoesNotReenterLoss();
+    TestRackKeepsRtoSnapshot();
+    TestMigrationResetsKccRecoveryState();
     TestKccPipeExcludesLost();
     TestKccTxStartOnTlp();
     TestKccDsackCountsDelivered();
@@ -2081,6 +3889,19 @@ int main() {
     TestKccSackDeliveredNoDoubleCount();
     TestKccDifferentialNewFields();
     TestKccRecoveryDifferential();
+    TestKccJitterEwmaWideMul();
+    TestKccOracleZeroMss();
+    TestEifelRejectsNewerTsval();
+    TestDsackUndoAfterRtoWithoutTsopt();
+    TestNoUndoWhileRetransInFlight();
+    TestNoUndoWhenOwnRetransmitCounts();
+    TestB7A1AppLimitedCond3Packets();
+    TestB7A2MarkerClearedOnEveryAck();
+    TestB7A4SackClearsLostOut();
+    TestB7B1EmptyDsackIgnored();
+    TestB7B2ReversedBlockDoesNotPoisonGate();
+    TestB7B3OversizedDsackRejected();
+    TestB7B4DsackGateUsesPacketDomain();
     xtcp::cc::KccTestResetRandom();
     if (0 < g_failures) {
         std::fprintf(stderr, "test_cc_kcc: %d failure(s)\n", g_failures);

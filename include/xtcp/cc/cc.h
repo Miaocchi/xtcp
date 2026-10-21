@@ -158,6 +158,11 @@ namespace xtcp {
             kCaEventNewData    = 4,
             kCaEventTxStart    = 5,  /**< First data after an idle pipe
                                           (kernel CA_EVENT_TX_START) */
+            kCaEventCompleteCwr = 6, /**< A cwnd reduction episode ended
+                                          (kernel CA_EVENT_COMPLETE_CWR,
+                                          tcp_end_cwnd_reduction). Append-only:
+                                          out-of-tree ops that switch on the
+                                          old values are unaffected. */
         };
 
         /**
