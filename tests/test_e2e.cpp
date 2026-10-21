@@ -43,12 +43,12 @@ static void Pump(xtcp::ndi::ManualBackend& from, xtcp::ndi::ManualBackend& to, U
         }
     }
     // Super-MSS sends buffer until the delayed-ACK clock (40 ms) frees the
-    // window; give the timers real time to advance. Yield only when traffic
-    // moved - an idle poll returns immediately (a 1ms sleep per idle round
-    // costs ~15.6ms on Windows clock granularity).
-    if (moved) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    // window; give the timers real time to advance. An idle pump must also
+    // yield: when the send buffer is full and only the pacing clock limits
+    // progress, a busy retry loop advances no wall-clock time, so neither the
+    // pacing deadline nor the ACK timers can fire.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    (void)moved;
 }
 
 static void TestCcWiredToStack() {

@@ -88,6 +88,15 @@ int main() {
         client_ep.addr[0] = 0xC0A80102;
         client_ep.port = 40000;
         CHECK(stack_b.Listen(server_ep));
+        // This test exercises RACK, which is independent of the congestion
+        // algorithm, but its reorder probe needs a >= 6-segment window. The
+        // old KCC port satisfied that pin only because its private cwnd
+        // mirror never followed RTO/PRR decreases; the kernel-faithful model
+        // (base sk->snd_cwnd, target = cwnd_gain * BDP) legitimately limits
+        // this paced loopback flow to the 4-segment floor. Use the built-in
+        // Reno sender so the window is CC-independent; stack_b keeps the
+        // default algorithm (the receiver side does not grow a send window).
+        stack_a.SetDefaultCongestionControl("");
 
         const UInt64 conn = stack_a.Connect(client_ep, server_ep);
         CHECK(0 != conn);
@@ -172,7 +181,9 @@ int main() {
         // recovery above left the cwnd near its 1-segment floor. The reorder
         // probe needs a window of at least six segments to place all six
         // frames in the backend at once - slow-start it back up with a clean
-        // burst first.
+        // burst first. The sender is pinned to Reno above, so the RTO cut /
+        // slow-start / congestion-avoidance arithmetic described here is
+        // Reno's; the burst size is unchanged.
         sent = 0;
         // The Eifel fix (RFC 3522, fresh-TSval RTO retransmit) no longer
         // undoes a REAL-loss RTO cut, so the tail-loss recovery left the

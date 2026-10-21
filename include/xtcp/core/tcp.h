@@ -49,8 +49,29 @@ namespace xtcp {
             UInt32  rcv_wnd        = 65535;
             UInt32  snd_wnd        = 65535;
             UInt32  inflight       = 0;       /**< Bytes in flight */
-            UInt32  app_limited    = 0;       /**< Application-limited flag */
+            /**
+             * @brief Kernel tp->app_limited marker (u32 wrap semantics):
+             *        0 = not app-limited; otherwise the (UInt32) delivered+
+             *        inflight watermark latched at the send entry.  Cleared
+             *        only when delivered passes the watermark using the
+             *        kernel after() comparison.
+             */
+            UInt32  app_limited    = 0;
             UInt32  snd_cwnd_cnt   = 0;       /**< Bytes acked toward the next CA increment (kernel tcp_sock equivalent) */
+            /**
+             * @brief Kernel tp->delivered equivalent in PACKETS (segments):
+             *        cumulative ACKs and newly SACKed segments both count
+             *        (tcp_count_delivered). KCC's delivered-round and
+             *        bandwidth math use this domain; the byte-domain
+             *        `delivered` above is unchanged for BBR/CUBIC.
+             */
+            UInt64  delivered_pkts = 0;
+            /** @brief Kernel icsk_ca_state (0=Open,1=Disorder,2=CWR,
+             *         3=Recovery,4=Loss) for the CC recovery hooks. */
+            Byte    ca_state = 0;
+            UInt32  prior_cwnd = 0;           /**< Kernel tp->prior_cwnd */
+            UInt32  prior_ssthresh = 0;       /**< Kernel tp->prior_ssthresh */
+            Byte    packet_conservation = 0;  /**< Kernel kcc packet_conservation */
             void*   ca_priv        = NULLPTR; /**< Algorithm private state */
         };
 
@@ -744,6 +765,28 @@ namespace xtcp {
                 UInt32      rto = 0;       /**< Current per-segment RTO */
                 UInt32      retries = 0;
                 UInt32      sacked = 0;    /**< Bytes SACKed within this segment (RFC 6675 pipe) */
+                UInt64      sent_delivered = 0; /**< cc_.delivered at last (re)transmit (bytes) */
+                Byte        app_limited = 0;    /**< cc_.app_limited != 0 at last (re)transmit */
+                Byte        is_retrans = 0;     /**< Data was (re)transmitted (TCPCB_RETRANS) */
+                /**
+                 * @brief Kernel tcp_skb_pcount equivalent: packets this
+                 *        segment represents, ceil(len/mss) (tcp_output_v66.c
+                 *        tcp_set_skb_tso_segs). Refreshed on every (re)
+                 *        transmission, like the other send snapshots.
+                 */
+                UInt32      pkt_count = 1;
+                /**
+                 * @brief Kernel TCPCB tx.delivered (PACKETS): cc_.delivered_pkts
+                 *        when this segment was last (re)transmitted. Feeds
+                 *        RateSample.prior_delivered_pkts.
+                 */
+                UInt64      sent_delivered_pkts = 0;
+                /**
+                 * @brief Kernel TCPCB_LOST: this segment was declared lost
+                 *        (per-segment, distinct from cc_.lost which is the
+                 *        bytes-lost-since-last-sample accumulator).
+                 */
+                Byte        lost = 0;
                 buf::BufRef data;          /**< Payload reference (zero-copy retransmit) */
             };
 
@@ -905,6 +948,31 @@ namespace xtcp {
             void OnAckReceived(UInt32 ack, bool ece, TimePoint now, const TcpOpts* opts) noexcept;
             void RackDetectLoss(TimePoint now) noexcept;
             UInt32 PipeBytes() const noexcept;
+            /**
+             * @brief Kernel tcp_packets_in_flight() equivalent in bytes:
+             *        packets_out - left_out + retrans_out, i.e.
+             *        inflight - sacked + retransmitted (tcp_h_v66.h:1217).
+             *        A lost segment stops counting as in-flight, so this is
+             *        the CA_EVENT_TX_START gate (tcp_output_v66.c:167-168),
+             *        NOT the raw sequence-space distance.
+             */
+            UInt32 PipeInFlightBytes() const noexcept;
+            /**
+             * @brief Kernel interval_to_edt in MICROSECONDS: how long until
+             *        the pacing queue drains (tp->tcp_wstamp_ns equivalent,
+             *        i.e. pacing_deadline_ - now, clamped at 0). Fed into
+             *        RateSample.pacing_edt_us so KCC's
+             *        kcc_packets_in_net_at_edt can credit bw*interval.
+             */
+            UInt32 PacingEdtUs(TimePoint now) const noexcept;
+            /**
+             * @brief Emits one cumulative rate sample (kernel tcp_rate_gen).
+             *        Shared by the cumulative-ACK path and the SACK/DSACK
+             *        dup-ACK path: the kernel samples EVERY ACK, so a dup-ACK
+             *        that only advanced SACK/DSACK delivery must report too.
+             */
+            void EmitRateSample(TimePoint now, UInt32 acked, UInt32 rtt_sample,
+                                UInt64 prior_in_flight_bytes, UInt32 ack) noexcept;
             void RetransmitEarliestMissing(TimePoint now, const TcpOpts* opts) noexcept;
             /**
              * @brief Processes peer data arriving in a closing state
@@ -919,6 +987,30 @@ namespace xtcp {
             bool ProcessClosingData(const Byte* payload, UInt32 payload_len, UInt32 seq,
                                     bool has_fin, TimePoint now, UInt32 ts_val = 0) noexcept;
             void CutCwnd() noexcept;
+            /**
+             * @brief Sets the kernel icsk_ca_state mirror (0=Open, 3=Recovery,
+             *        4=Loss) and forwards it to the CC set_state hook when the
+             *        state actually changes.
+             */
+            void SetCaState(Byte new_state) noexcept;
+            /**
+             * @brief Kernel tcp_rate_check_app_limited equivalent, called at
+             *        the application send entry BEFORE consuming new data:
+             *        while the sender has less than one MSS pending, the
+             *        window is not full and nothing is marked lost, latch
+             *        app_limited = delivered+inflight (1 when zero).  A
+             *        non-matching call never clears an existing marker (the
+             *        marker is cleared only when delivered passes it).
+             */
+            void MaybeMarkAppLimited(UInt32 inflight) noexcept;
+            /**
+             * @brief Dispatches kCaEventTxStart when a data segment is about
+             *        to leave an empty pipe (kernel CA_EVENT_TX_START).
+             *        The CC implementation decides whether the connection is
+             *        app-limited.  A rate change invalidates the pacing
+             *        deadline (the caller may immediately re-arm it).
+             */
+            void NotifyTxStart(bool pipe_empty) noexcept;
             void NotifyStateChanged() noexcept;
             void MaybeFinishClose(TimePoint now) noexcept;
             static TimePoint NowUs() noexcept;
@@ -1067,6 +1159,19 @@ namespace xtcp {
             TimePoint   pacing_deadline_ = 0;    /**< Next allowed send time (pacing, bytes/sec) */
             TimePoint   last_rate_sample_ = 0;   /**< Last rate-sample time (for interval_us) */
             UInt64      last_delivered_ = 0;     /**< cc_.delivered at the last emitted rate sample (delivered-delta base) */
+            UInt64      last_delivered_pkts_ = 0; /**< cc_.delivered_pkts at the last emitted sample (packet-domain base) */
+            UInt32      dsack_dups_ = 0;         /**< Kernel tp->dsack_dups (DSACK segment counter) */
+            UInt64      batch_prior_delivered_ = 0; /**< max SentSeg.sent_delivered popped since the last emitted sample */
+            UInt64  batch_prior_delivered_pkts_ = 0; /**< max SentSeg.sent_delivered_pkts popped since the last emitted sample */
+            /** @brief Kernel tp->lost_out (PACKETS): segments marked lost
+             *         (per-seg SentSeg.lost) and not yet delivered. */
+            UInt32  lost_out_pkts_ = 0;
+            /** @brief Kernel tp->retrans_out (PACKETS): retransmitted
+             *         segments still in flight. */
+            UInt32  retrans_out_pkts_ = 0;
+            Byte        batch_app_limited_ = 0;     /**< app-limited snapshot of the newest popped segment */
+            bool        batch_retrans_ = false;     /**< any segment popped by the CURRENT ACK was retransmitted */
+            bool        last_ack_delayed_ = false;  /**< current ACK looks like a delayed ACK (kernel flag) */
         };
 
         /**
