@@ -2362,16 +2362,21 @@ namespace xtcp {
         }
 
         void TcpConn::CutCwnd() noexcept {
-            // RFC 5681: ssthresh = max(FlightSize/2, 2*SMSS) on loss. Packets
-            // units: half of the in-flight window, at least two segments.
-            // Kernel tcp_enter_loss reads tcp_packets_in_flight() LIVE, not a
-            // cached scalar: SACKed and LOST bytes left the network, so the
-            // reduction must not be computed from the raw sequence distance
-            // (audit B5-D3). cc_.inflight is only refreshed on transmit and
-            // goes stale the moment a SACK block retires a segment.
+            // Kernel tcp_enter_loss (tcp_input_66.c:2154-2178) computes the
+            // reduction in two steps:
+            //   ssthresh = icsk_ca_ops->ssthresh(sk)   (Reno: max(cwnd >> 1, 2))
+            //   cwnd     = tcp_packets_in_flight(tp) + 1
+            // The two use DIFFERENT bases: ssthresh follows the WINDOW, cwnd
+            // follows the live pipe. The port used packets_in_flight/2 for
+            // both, which under a lost-head RTO (the head is marked lost
+            // before the cut) halves an already-reduced number.
+            //
+            // tcp_packets_in_flight() is read LIVE, not from the cached
+            // cc_.inflight: SACKed and LOST bytes have left the network, and
+            // cc_.inflight is only refreshed on transmit (audit B5-D3).
             const UInt32 pipe_bytes = PipeInFlightBytes();
-            UInt32 inflight_pkts = (pipe_bytes + peer_mss_ - 1) / peer_mss_;
-            UInt32 ssthresh = inflight_pkts / 2;
+            // Kernel tcp_reno_ssthresh: max(cwnd >> 1, 2) (tcp_cong_66.c).
+            UInt32 ssthresh = cc_.snd_cwnd >> 1;
             if (ssthresh < 2) {
                 ssthresh = 2;
             }
@@ -4844,6 +4849,14 @@ namespace xtcp {
             rto_ = ckpt.rto;
             srtt_ = ckpt.srtt;
             rttvar_ = ckpt.rttvar;
+            // The checkpoint carries no out-of-order reassembly buffer (ooo_
+            // is deliberately dropped: the peer retransmits what it sent past
+            // the frontier), so the byte counter that mirrors it must be
+            // cleared too. Leaving it set would make AdvertisedWindow() report
+            // window_ - ooo_bytes_ forever, i.e. permanently shrink the receive
+            // window by data that no longer exists.
+            ooo_.clear();
+            ooo_bytes_ = 0;
             // Migration starts a NEW delivered epoch: the checkpoint does not
             // carry cc_.delivered nor the per-segment send snapshots (both
             // default to 0). Carrying a stale epoch would make every ACK look
@@ -4873,6 +4886,28 @@ namespace xtcp {
             total_retrans_pkts_ = 0;
             dsack_dups_ = 0;
             max_window_ = (0 < snd_wnd_) ? snd_wnd_ : kDefaultWindow;
+            // Transient send/receive flags belong to the OLD connection: the
+            // destination may have queued a delayed ACK, a D-SACK, or a
+            // pending CWR echo of its own. Carrying any of them past the
+            // restore makes the migrated flow emit control flags it has no
+            // reason to send - a stale cwr_pending_ in particular tells the
+            // peer we reduced the window for congestion that never happened on
+            // this flow. Their deadlines go with them.
+            ack_pending_ = false;
+            ack_count_ = 0;
+            ack_deadline_ = 0;
+            quickack_ = false;
+            cwr_pending_ = false;
+            ecn_ce_seen_ = false;
+            ecn_reduce_at_ = 0;
+            dsack_pending_ = false;
+            dsack_left_ = 0;
+            dsack_right_ = 0;
+            dupack_count_ = 0;
+            dupack_deadline_ = 0;
+            challenge_count_ = 0;
+            challenge_deadline_ = 0;
+            ack_not_dup_ = false;
             // The checkpoint carries no congestion state, so every episode /
             // undo field must be reset to its "no episode" value. Otherwise
             // the TARGET connection's previous values leak into the migrated

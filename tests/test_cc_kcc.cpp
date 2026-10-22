@@ -1345,8 +1345,10 @@ namespace {
 
     std::vector<Byte> BuildSeg(UInt16 sport, UInt16 dport, UInt32 seq, UInt32 ack,
                                UInt16 flags, UInt16 window = 65535,
-                               bool sack = false, UInt32 sl = 0, UInt32 sr = 0) {
-        std::vector<Byte> seg(sack ? 32 : 20, 0);
+                               bool sack = false, UInt32 sl = 0, UInt32 sr = 0,
+                               UInt32 payload_len = 0) {
+        const UInt32 hdr = sack ? 32u : 20u;
+        std::vector<Byte> seg(hdr + payload_len, 0);
         Byte* t = seg.data();
         t[0] = static_cast<Byte>(sport >> 8); t[1] = static_cast<Byte>(sport & 0xFF);
         t[2] = static_cast<Byte>(dport >> 8); t[3] = static_cast<Byte>(dport & 0xFF);
@@ -2780,7 +2782,11 @@ namespace {
         const UInt32 cwnd_rto = h.conn.Cwnd();
         const UInt32 ssth_rto = h.conn.Ssthresh();
         CHECK(1u == cwnd_rto);
-        CHECK(2u == ssth_rto);
+        // Kernel tcp_reno_ssthresh is max(cwnd >> 1, 2) (tcp_cong_66.c) - it
+        // follows the WINDOW, not the post-loss pipe. The harness CC has no
+        // ssthresh hook, so the Reno branch applies: cwnd was 10 before the
+        // cut, giving 5.
+        CHECK(5u == ssth_rto);
 
         // Dup-ACK whose SACK block delivers segment 3: RACK anchors on it and
         // segment 2 (sent before the RTO) is overdue -> a loss verdict.
@@ -3143,6 +3149,58 @@ namespace {
     }
 
     /**
+     * @brief Migration must drop the out-of-order byte counter with the
+     *        buffer it mirrors.
+     *
+     * The checkpoint carries no reassembly buffer (ooo_ is deliberately
+     * dropped: the peer retransmits past the frontier), but ooo_bytes_ was
+     * left in place. AdvertisedWindow() reports (window_ - ooo_bytes_) >>
+     * rcv_wscale_, so a stale counter permanently shrinks the migrated
+     * flow's receive window by data that no longer exists.
+     *
+     * Red baseline: after ApplyCheckpoint the advertised window stays
+     * reduced by the source's ooo_bytes_.
+     */
+    void TestMigrationClearsOooBytes() {
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn src(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        src.SetPeerMss(kMss);
+        src.SetSndBuf(4u << 20);
+        const UInt32 wnd_clean = src.AdvertisedWindow();
+
+        // The DESTINATION already holds out-of-order data of its own before the
+        // restore. ApplyCheckpoint replaces rcv_nxt_/window_ from the source
+        // and drops ooo_, so the destination's byte counter must be dropped
+        // with it - otherwise the migrated flow advertises a window reduced by
+        // data that belongs to a different connection.
+        std::vector<xtcp::buf::BufRef> tx2;
+        xtcp::core::TcpConn dst(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 500, 900,
+            [&tx2](xtcp::buf::BufRef&& p) { tx2.push_back(std::move(p)); });
+        dst.SetPeerMss(kMss);
+        dst.SetSndBuf(4u << 20);
+        xtcp::core::TimePoint now = 1000;
+        const std::vector<Byte> ooo =
+            BuildSeg(40000, 443, dst.RcvNxt() + 4 * kMss, 901,
+                     static_cast<UInt16>(xtcp::core::kFlagAck), 65535,
+                     false, 0, 0, kMss);
+        dst.OnSegment(ooo.data(), static_cast<UInt32>(ooo.size()), now);
+        const UInt32 wnd_dst_ooo = dst.AdvertisedWindow();
+        std::fprintf(stderr, "[mig-ooo] dst clean=%u after ooo=%u\n",
+                     wnd_clean, wnd_dst_ooo);
+        CHECK(wnd_dst_ooo < wnd_clean);   // the buffer really was charged
+
+        const xtcp::core::TcpConn::ConnCheckpoint ck = src.MakeCheckpoint();
+        dst.ApplyCheckpoint(ck);
+        const UInt32 wnd_after = dst.AdvertisedWindow();
+        std::fprintf(stderr, "[mig-ooo] dst after restore=%u\n", wnd_after);
+        // The out-of-order buffer did not travel, so the window is whole again.
+        CHECK(wnd_after == wnd_clean);
+    }
+
+    /**
      * @brief PipeInFlightBytes must subtract LOST bytes too.
      *
      * Kernel tcp_packets_in_flight() = packets_out - (sacked_out + lost_out)
@@ -3158,41 +3216,65 @@ namespace {
      * @brief B5-D3 / B6-D1: the CC-visible in-flight count must be
      *        tcp_packets_in_flight, not the raw snd_nxt - snd_una distance.
      *
-     * Kernel tcp_packets_in_flight() = packets_out - (sacked_out + lost_out)
-     * + retrans_out (tcp_66.h:1198-1220). tcp_cwnd_reduction sets
-     * cwnd = tcp_packets_in_flight(tp) + sndcnt and CutCwnd's plugin branch
-     * sets cwnd = inflight_pkts + 1, so counting SACKed bytes as in flight
+     * Kernel tcp_enter_loss sets cwnd = tcp_packets_in_flight(tp) + 1
+     * (tcp_input_66.c:2176) for a CC that installs an ssthresh hook, and
+     * tcp_packets_in_flight() = packets_out - (sacked_out + lost_out) +
+     * retrans_out (tcp_66.h:1198-1220). Counting SACKed bytes as in flight
      * inflates the post-loss window.
      *
-     * Observable: the KCC-shaped CC's ssthresh hook records nothing, so use
-     * CutCwnd's own effect - after an RTO on a connection whose tail is
-     * already SACKed, cwnd must be 2 (1 unsacked MSS + 1), not 5 (4 MSS + 1).
+     * Observable: a passthrough ssthresh hook routes the cut through the
+     * plugin branch, so cwnd becomes pipe_pkts + 1.
      *
-     * Red baseline (raw distance): cwnd == 5.
+     * Red baseline (raw distance): with 8 segments outstanding and 7 SACKed,
+     * cwnd would be 8 + 1 = 9; the kernel formula gives 1 + 1 = 2.
      */
     void TestCcInflightExcludesSacked() {
-        FsmHarness h;
-        h.conn.SetSackOk(true);
-        h.conn.SetSndBuf(8u << 20);
-        for (UInt32 i = 0; i < 8; ++i) {
-            h.Send(kMss);
+        static bool registered = false;
+        if (!registered) {
+            XtcpCongestionOps ops;
+            ops.name = "cc_test_passthrough";
+            ops.ssthresh = KccShapeSsthresh;   // passthrough -> plugin branch
+            CHECK(xtcp::cc::RegisterCongestionControl(ops));
+            registered = true;
         }
-        const UInt32 una = h.conn.SndUna();
-        const UInt32 end = h.conn.SndNxt();
-        // SACK the last seven segments: only the head is still in the pipe.
-        h.now += 1000;
-        h.Deliver(una, xtcp::core::kFlagAck, 65535, true, una + kMss, end);
-        CHECK(8u * kMss == h.conn.SndInflight());   // the queue is untouched
-        // RTO -> CutCwnd: ssthresh = inflight_pkts / 2, floor 2.
-        // pipe = 1 MSS -> 1/2 = 0 -> floor 2.
-        // raw distance = 8 MSS -> 8/2 = 4.
-        h.now += 3000000;
-        h.conn.OnRetransmitTimer(h.now);
-        std::fprintf(stderr, "[B5D3] after RTO ssthresh=%u (raw-distance value would be 4)\n",
-                     h.conn.Ssthresh());
-        CHECK(2u == h.conn.Ssthresh());
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSackOk(true);
+        conn.SetSndBuf(8u << 20);
+        CHECK(conn.SetCongestionControl("cc_test_passthrough"));
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 8; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 una = conn.SndUna();
+        const UInt32 end = conn.SndNxt();
+        // SACK the last seven segments: only the head is still unconfirmed.
+        now += 1000;
+        DeliverRawAck(conn, now, una, xtcp::core::kFlagAck, true, una + kMss, end);
+        CHECK(8u * kMss == conn.SndInflight());   // the queue is untouched
+        // RTO -> CutCwnd. The kernel marks the head LOST first
+        // (tcp_timeout_mark_lost) and only then computes the reduction, so
+        // packets_in_flight is 0 here and cwnd = 0 + 1 = 1 for the plugin
+        // branch. The point of this case is the SEPARATION of the two bases:
+        // ssthresh follows the WINDOW (tcp_reno_ssthresh = max(cwnd>>1, 2))
+        // while cwnd follows the live pipe. A raw-distance implementation
+        // would report cwnd 9 (8 MSS in flight + 1).
+        now += 3000000;
+        conn.OnRetransmitTimer(now);
+        std::fprintf(stderr,
+                     "[B5D3] after RTO cwnd=%u ssthresh=%u (raw-distance cwnd would be 9)\n",
+                     conn.Cwnd(), conn.Ssthresh());
+        CHECK(1u == conn.Cwnd());          // pipe is empty once the head is LOST
+        // The passthrough hook returns the current threshold unchanged, which
+        // is what a KCC-shaped CC does (kcc_set_cwnd_to_recover_or_restore
+        // owns the window, not ssthresh). The Reno `cwnd >> 1` form belongs to
+        // tcp_reno_ssthresh and is covered by TestRenoSsthreshFollowsCwnd.
+        CHECK(0x7FFFFFFFu == conn.Ssthresh());
     }
-
     void TestKccPipeExcludesLost() {
         // Fully-lost flight, retransmitted: the TX_START gate must see the
         // pre-retransmission pipe (kernel tcp_event_data_sent runs INSIDE
@@ -4166,6 +4248,7 @@ int main() {
     TestRackKeepsRtoSnapshot();
     TestMigrationResetsKccRecoveryState();
     TestMigrationKeepsRetransTag();
+    TestMigrationClearsOooBytes();
     TestKccPipeExcludesLost();
     TestCcInflightExcludesSacked();
     TestKccTxStartOnTlp();
