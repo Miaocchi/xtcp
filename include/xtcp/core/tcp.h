@@ -38,9 +38,27 @@ namespace xtcp {
             UInt32  snd_cwnd       = 10;      /**< Congestion window (packets); RFC 6928 initial window (10 segs, Linux initcwnd) */
             UInt32  snd_ssthresh   = 0x7FFFFFFF;
             UInt64  pacing_rate    = 0;       /**< Bytes per second */
+            /**
+             * @brief Kernel sk->sk_max_pacing_rate: the hard ceiling a CC
+             *        algorithm may not pace above (SO_MAX_PACING_RATE).
+             *        The kernel default is ~0U (no limit), which is what
+             *        this mirrors; kcc_bw_to_pacing_rate applies
+             *        min_t(u64, rate, sk_max_pacing_rate)
+             *        (tcp_kcc.c:3563-3567).
+             */
+            UInt64  max_pacing_rate = 0xFFFFFFFFFFFFFFFFull;
             UInt64  delivered      = 0;       /**< Total bytes delivered */
             UInt64  delivered_mstamp = 0;     /**< Last delivery timestamp (ms) */
             UInt64  lost           = 0;       /**< Total lost bytes */
+            /**
+             * @brief Kernel tp->lost equivalent in PACKETS: the count of
+             *        segments freshly marked lost since the last rate sample.
+             *        rate_sample.losses is this domain (tcp_input_66.c:3936
+             *        `lost = tp->lost - lost`), and KCC subtracts it from cwnd
+             *        directly (`cwnd -= rs->losses`, tcp_kcc.c:3993). The
+             *        byte-domain `lost` above stays for BBR/CUBIC.
+             */
+            UInt32  lost_pkts      = 0;
             UInt64  lsndtime       = 0;       /**< Last send time (ms) */
             UInt32  srtt_us        = 0;       /**< Smoothed RTT (us) */
             UInt32  mdev_us        = 0;       /**< RTT variance (us) */

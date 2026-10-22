@@ -120,6 +120,13 @@ namespace xtcp {
         UInt32 KccTestIsNextCyclePhase(XtcpConnCc* sk, const RateSample* rs,
                                        UInt64 now_us) noexcept;
         UInt64 KccTestPacketsInNetAtEdt(UInt64 inflight_bytes, UInt32 gain, UInt32 mss,
-                                        UInt64 bw_pkts, UInt32 edt_us) noexcept;
+                                        UInt64 bw_pkts, UInt32 edt_us,
+                                        UInt32 tso_segs_goal) noexcept;
+        /**
+         * @brief Kernel kcc_tso_segs_goal for this connection's current
+         *        pacing rate (the gain headroom kcc_packets_in_net_at_edt
+         *        adds when pacing_gain > BBR_UNIT).
+         */
+        UInt32 KccTestTsoSegsGoal(XtcpConnCc* sk) noexcept;
     }
 }

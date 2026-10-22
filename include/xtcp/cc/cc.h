@@ -38,6 +38,15 @@ namespace xtcp {
             UInt32  interval_us    = 0;  /**< Elapsed since last sample */
             UInt32  rtt_us         = 0;  /**< RTT sample (0 = none) */
             UInt32  lost           = 0;  /**< Lost bytes since last sample */
+            /**
+             * @brief Kernel rs->losses equivalent, PACKETS: segments freshly
+             *        marked lost since the last sample (tcp_input_66.c:3936
+             *        `lost = tp->lost - lost`). KCC subtracts this from cwnd
+             *        directly (tcp_kcc.c:3993 `cwnd -= rs->losses`), so the
+             *        byte-domain `lost` above cannot stand in for it: a
+             *        2*MSS loss and a 1-byte loss must not look the same.
+             */
+            UInt32  lost_pkts      = 0;
             UInt32  acked          = 0;
             UInt32  is_app_limited = 0;  /**< Send-time app-limited snapshot (0/1) */
             /**

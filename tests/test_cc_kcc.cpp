@@ -134,11 +134,18 @@ namespace {
             now_us += interval_us;
             total += delivered;
             total_pkts += delivered_pkts;
+            // Kernel rs->losses is a PACKET count (tcp_input_66.c:3936), and
+            // KCC subtracts it from cwnd directly (tcp_kcc.c:3993). The
+            // driver's public `lost` input is BYTES (it mirrors the port's
+            // RateSample::lost), so translate once here and feed the same
+            // packet count to both sides.
+            const UInt64 lost_pkts = (0 == lost) ? 0
+                : ((static_cast<UInt64>(lost) + kMss - 1) / kMss);
             ref.srtt_us = sk.srtt_us;
             kcc_core_on_ack_pkts(&ref, static_cast<s64>(now_us),
                                  static_cast<s64>(delivered_pkts), static_cast<s64>(rtt_us),
                                  static_cast<s64>(flight), static_cast<s64>(flight),
-                                 static_cast<s64>(lost),
+                                 static_cast<s64>(lost_pkts),
                                  static_cast<s64>(prior_pkts),
                                  static_cast<s64>(total_pkts),
                                  is_ack_delayed ? 1 : 0, is_app_limited ? 1 : 0,
@@ -149,6 +156,7 @@ namespace {
             rs.rtt_us = rtt_us;
             rs.acked = delivered;
             rs.lost = lost;
+            rs.lost_pkts = static_cast<UInt32>(lost_pkts);
             rs.is_app_limited = is_app_limited ? 1u : 0u;
             rs.prior_delivered = prior_delivered;
             rs.delivered_total = total;
@@ -547,6 +555,64 @@ namespace {
         CheckRefCommon(d);
     }
 
+    /**
+     * @brief B8-D7(c): the pacing rate must respect sk_max_pacing_rate.
+     *
+     * Kernel kcc_bw_to_pacing_rate (tcp_kcc.c:3563-3567) returns
+     *   min_t(u64, kcc_rate_bytes_per_sec(sk, bw, gain), sk->sk_max_pacing_rate)
+     * and kcc_set_pacing_rate (tcp_kcc.c:3599-3637) assigns only that value,
+     * so a user SO_MAX_PACING_RATE caps the STARTUP ramp and the monotonic
+     * gate compares capped values. The port had no clamp at all, so KCC paced
+     * above the user's ceiling.
+     *
+     * Red baseline (no clamp): pacing_rate == 1068150599751 with a 1 MB/s cap.
+     */
+    void TestKccMaxPacingRateClamp() {
+        {
+            // STARTUP (full_bw_reached == 0): the monotonic branch.
+            Driver d;
+            const UInt64 cap = 1000000;  // 1 MB/s
+            d.sk.max_pacing_rate = cap;
+            d.ref.max_pacing_rate = cap;
+            d.Ack(1000, 1, 0xFFFFFFFFu);
+            std::fprintf(stderr, "[D7c] startup pacing=%llu cap=%llu\n",
+                         static_cast<unsigned long long>(d.sk.pacing_rate),
+                         static_cast<unsigned long long>(cap));
+            CHECK(cap == d.sk.pacing_rate);
+            CHECK(static_cast<s64>(cap) == kcc_core_pacing_rate(&d.ref));
+            CheckRefCommon(d);
+        }
+        {
+            // Post-STARTUP (full_bw_reached == 1): reach it naturally with the
+            // 3%/round staircase the plateau detector needs.
+            Driver d;
+            const UInt64 cap = 1000000;
+            d.sk.max_pacing_rate = cap;
+            d.ref.max_pacing_rate = cap;
+            UInt32 delivered = 14600;
+            for (UInt32 i = 0; i < 8; ++i) {
+                d.Round(10000, delivered);
+                delivered += delivered * 3 / 100;
+            }
+            CHECK(1 == d.Snap().full_bw_reached);
+            CHECK(1 == d.ref.full_bw_reached);
+            std::fprintf(stderr, "[D7c] post-startup pacing=%llu cap=%llu\n",
+                         static_cast<unsigned long long>(d.sk.pacing_rate),
+                         static_cast<unsigned long long>(cap));
+            CHECK(d.sk.pacing_rate <= cap);
+            CHECK(static_cast<s64>(d.sk.pacing_rate) == kcc_core_pacing_rate(&d.ref));
+            CheckRefCommon(d);
+        }
+        {
+            // No cap (kernel default ~0): the rate is unchanged.
+            Driver d;
+            d.Ack(1000, 1, 0xFFFFFFFFu);
+            CHECK(kPacingExtreme == d.sk.pacing_rate);
+            CHECK(static_cast<s64>(kPacingExtreme) == kcc_core_pacing_rate(&d.ref));
+            CheckRefCommon(d);
+        }
+    }
+
     void TestKccBdpSaturation() {
         // product = max_bw * min_rtt overflows u64 on a long-stall RTT
         // (4s) with the clamped bandwidth. The saturated BDP must stay
@@ -895,9 +961,23 @@ namespace {
             // Not drained: a huge pipe only leaves via the 4*min_rtt timeout.
             Driver d;
             const KccSnapshot entry = FeedFullBw(d);
+            // Kernel kcc_check_drain sets snd_ssthresh = kcc_inflight(...),
+            // which is the BDP WITH the quantization budget
+            // (kcc_quantization_budget: += 3 * tso_segs_goal, then even-align),
+            // not the bare BDP (audit B6-D2).
             const UInt64 bdp = kcc_bdp_packets(entry.max_bw, entry.min_rtt_us, 256);
-            const UInt64 expected_ssthresh = bdp;
-            CHECK(expected_ssthresh == d.sk.snd_ssthresh);
+            const UInt32 tso_goal = xtcp::cc::KccTestTsoSegsGoal(&d.sk);
+            const UInt64 expected_ssthresh = (bdp + 3ull * tso_goal + 1ull) & ~UInt64(1);
+            // The budget depends on the pacing rate AT the DRAIN entry, which
+            // the post-hoc probe cannot reconstruct exactly (pacing_rate has
+            // already advanced). Assert the invariant instead: ssthresh is the
+            // even-aligned BDP plus 3*tso_goal for SOME tso_goal in 1..127,
+            // i.e. strictly above the bare BDP and within the documented cap.
+
+            CHECK(bdp < d.sk.snd_ssthresh);
+            CHECK(0 == (d.sk.snd_ssthresh & 1u));            // even-aligned
+            CHECK(d.sk.snd_ssthresh <= bdp + 3ull * 127u + 1u);
+            CHECK(expected_ssthresh <= d.sk.snd_ssthresh + 6u);
             CHECK(entry.drain_enter_stamp_us == entry.last_ack_us);
             d.flight = 300000;  // ~10x BDP, never drained
             UInt32 delivered = 14600;
@@ -940,27 +1020,27 @@ namespace {
         const UInt64 bw = 1ull << 24;          // 1 segment per microsecond
 
         // Row 1: edt_us == 0 -> identical to the old (credit-free) formula.
-        CHECK(2 * mss == KccTestPacketsInNetAtEdt(2 * mss, 256, mss, bw, 0));
-        CHECK(3 * mss == KccTestPacketsInNetAtEdt(2 * mss, 288, mss, bw, 0));  // +1 seg
+        CHECK(2 * mss == KccTestPacketsInNetAtEdt(2 * mss, 256, mss, bw, 0, 1));
+        CHECK(3 * mss == KccTestPacketsInNetAtEdt(2 * mss, 288, mss, bw, 0, 1));  // +1 seg
         // Sub-MSS remainder still counts as one whole packet (kernel ceil).
-        CHECK(mss == KccTestPacketsInNetAtEdt(1, 256, mss, bw, 0));
+        CHECK(mss == KccTestPacketsInNetAtEdt(1, 256, mss, bw, 0, 1));
 
         // Row 2: credit >= inflight -> 0. 3 us at 1 seg/us credits 3 packets.
-        CHECK(0 == KccTestPacketsInNetAtEdt(2 * mss, 256, mss, bw, 3));
-        CHECK(0 == KccTestPacketsInNetAtEdt(2 * mss, 288, mss, bw, 4));
+        CHECK(0 == KccTestPacketsInNetAtEdt(2 * mss, 256, mss, bw, 3, 1));
+        CHECK(0 == KccTestPacketsInNetAtEdt(2 * mss, 288, mss, bw, 4, 1));
 
         // Row 3: partial credit -> exactly (pkts - credit) * mss.
         // 2 in flight, 1 us credit -> 1 packet left.
-        CHECK(mss == KccTestPacketsInNetAtEdt(2 * mss, 256, mss, bw, 1));
+        CHECK(mss == KccTestPacketsInNetAtEdt(2 * mss, 256, mss, bw, 1, 1));
         // 5 in flight + gain headroom, 2 us credit -> 4 packets.
-        CHECK(4 * mss == KccTestPacketsInNetAtEdt(5 * mss, 288, mss, bw, 2));
+        CHECK(4 * mss == KccTestPacketsInNetAtEdt(5 * mss, 288, mss, bw, 2, 1));
         // Half-rate bw: 1 us credits 0.5 packet -> floor(credit) == 0.
-        CHECK(5 * mss == KccTestPacketsInNetAtEdt(5 * mss, 256, mss, bw / 2, 1));
+        CHECK(5 * mss == KccTestPacketsInNetAtEdt(5 * mss, 256, mss, bw / 2, 1, 1));
         // 2 us at half rate credits 1 packet -> 4 left.
-        CHECK(4 * mss == KccTestPacketsInNetAtEdt(5 * mss, 256, mss, bw / 2, 2));
+        CHECK(4 * mss == KccTestPacketsInNetAtEdt(5 * mss, 256, mss, bw / 2, 2, 1));
 
         // mss == 0 falls back to 1460 (never divides by zero).
-        CHECK(2 * 1460 == KccTestPacketsInNetAtEdt(2 * 1460, 256, 0, bw, 0));
+        CHECK(2 * 1460 == KccTestPacketsInNetAtEdt(2 * 1460, 256, 0, bw, 0, 1));
     }
 
     UInt32 ProbePhaseForSeed(UInt32 seed) {
@@ -1206,11 +1286,23 @@ namespace {
     UInt32 g_recTxStart = 0;
     UInt32 g_recMarker = 0;
     Byte g_recCaState = 0;
+    /**
+     * @brief First non-zero rs->prior_in_flight of the current ACK.
+     *
+     * One ACK can emit several rate samples (the SACK-only one and the one
+     * after the retransmission queue drains). The kernel's rs->prior_in_flight
+     * describes the pipe BEFORE the ACK cleaned it, i.e. the first sample.
+     * Reset this to 0 before delivering an ACK.
+     */
+    UInt64 g_recFirstPriorInflight = 0;
 
     void RecInit(XtcpConnCc*) noexcept {}
     void RecRelease(XtcpConnCc*) noexcept {}
     void RecControl(XtcpConnCc* sk, const RateSample* rs) noexcept {
         g_recLast = *rs;
+        if (0 == g_recFirstPriorInflight && 0 != rs->prior_in_flight_bytes) {
+            g_recFirstPriorInflight = rs->prior_in_flight_bytes;
+        }
         g_recMarker = sk->app_limited;
         g_recCaState = sk->ca_state;
         ++g_recCalls;
@@ -2705,6 +2797,72 @@ namespace {
     }
 
     /**
+     * @brief Batch 5 (D11) T5-2b: RACK must not recut the window in CA_CWR.
+     *
+     * Kernel tcp_enter_recovery guards its reduction with
+     * `if (!tcp_in_cwnd_reduction(sk))` (tcp_input_66.c:2834-2839) and
+     * tcp_in_cwnd_reduction covers BOTH CWR and Recovery (tcp_66.h:1245-1249).
+     * During CWR the reduction snapshot already exists, so a RACK verdict must
+     * only move the state - it must NOT run tcp_init_cwnd_reduction a second
+     * time and halve ssthresh again (audit B, batch 5 review).
+     *
+     * Red baseline (gate only excluded CA_Loss): after an ECE the flow sits in
+     * CWR with ssthresh already cut; a SACK dup-ACK makes RACK fire, which
+     * recuts ssthresh and sets fast_recovery_.
+     */
+    void TestRackDoesNotRecutInCwr() {
+        // A real handshake is required: ecn_active_ is only assigned on the
+        // handshake paths (tcp_fsm.cpp:5416 / :5582), never by a direct
+        // kEstablished construction.
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kSynSent, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSndBuf(8u << 20);
+        conn.SetEcnRequested(true);   // our SYN offers ECE+CWR
+        xtcp::core::TimePoint now = 1000;
+        conn.SendSyn();
+        const UInt32 our_syn_ts = TsvalOf(tx.back());
+        // Peer's SYN+ACK with ECE -> ecn_active_ = true.
+        const std::vector<Byte> synack = BuildSegTs(
+            443, 40000, 500, 101,
+            static_cast<UInt16>(xtcp::core::kFlagSyn | xtcp::core::kFlagAck |
+                                xtcp::core::kFlagEce),
+            65535, 777, our_syn_ts, false, 0, 0, true);
+        conn.OnSegment(synack.data(), static_cast<UInt32>(synack.size()), now);
+        CHECK(xtcp::core::TcpState::kEstablished == conn.State());
+        CHECK(conn.EcnActive());
+
+        for (UInt32 i = 0; i < 8; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 una = conn.SndUna();
+        // An ECE ACK enters CWR (kernel tcp_enter_cwr) and cuts ssthresh.
+        now += 1000;
+        const std::vector<Byte> ece = BuildSegTs(
+            40000, 443, 201, una,
+            static_cast<UInt16>(xtcp::core::kFlagAck | xtcp::core::kFlagEce),
+            65535, 778, our_syn_ts);
+        conn.OnSegment(ece.data(), static_cast<UInt32>(ece.size()), now);
+        const UInt32 ssth_cwr = conn.Ssthresh();
+        CHECK(0x7FFFFFFFu != ssth_cwr);      // the CWR cut was recorded
+        CHECK(!conn.FastRecovery());
+
+        // A later SACK dup-ACK: segment 1 is overdue, so RACK has a verdict.
+        now += 500000;
+        const std::vector<Byte> sack = BuildSegTs(
+            40000, 443, 201, una, xtcp::core::kFlagAck, 65535, 779, our_syn_ts,
+            true, una + 2 * kMss, una + 3 * kMss);
+        conn.OnSegment(sack.data(), static_cast<UInt32>(sack.size()), now);
+        std::fprintf(stderr, "[T5-2b] cwr ssth=%u -> after RACK ssth=%u fr=%d\n",
+                     ssth_cwr, conn.Ssthresh(), conn.FastRecovery() ? 1 : 0);
+        CHECK(!conn.FastRecovery());       // red: RACK entered Recovery
+        CHECK(ssth_cwr == conn.Ssthresh());  // red: ssthresh halved again
+    }
+
+    /**
      * @brief Batch 5 (D11) T5-3: the RTO snapshot survives a RACK verdict.
      *
      * T5-2 blocks the RACK entry outright; this test pins the OUTCOME the
@@ -2943,6 +3101,45 @@ namespace {
      * Red baseline: with one 1460-byte segment marked lost (retries == 0,
      * no SACK), the old formula returned 1460 (not 0) and no TX_START fired.
      */
+    /**
+     * @brief B5-D3 / B6-D1: the CC-visible in-flight count must be
+     *        tcp_packets_in_flight, not the raw snd_nxt - snd_una distance.
+     *
+     * Kernel tcp_packets_in_flight() = packets_out - (sacked_out + lost_out)
+     * + retrans_out (tcp_66.h:1198-1220). tcp_cwnd_reduction sets
+     * cwnd = tcp_packets_in_flight(tp) + sndcnt and CutCwnd's plugin branch
+     * sets cwnd = inflight_pkts + 1, so counting SACKed bytes as in flight
+     * inflates the post-loss window.
+     *
+     * Observable: the KCC-shaped CC's ssthresh hook records nothing, so use
+     * CutCwnd's own effect - after an RTO on a connection whose tail is
+     * already SACKed, cwnd must be 2 (1 unsacked MSS + 1), not 5 (4 MSS + 1).
+     *
+     * Red baseline (raw distance): cwnd == 5.
+     */
+    void TestCcInflightExcludesSacked() {
+        FsmHarness h;
+        h.conn.SetSackOk(true);
+        h.conn.SetSndBuf(8u << 20);
+        for (UInt32 i = 0; i < 8; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        const UInt32 end = h.conn.SndNxt();
+        // SACK the last seven segments: only the head is still in the pipe.
+        h.now += 1000;
+        h.Deliver(una, xtcp::core::kFlagAck, 65535, true, una + kMss, end);
+        CHECK(8u * kMss == h.conn.SndInflight());   // the queue is untouched
+        // RTO -> CutCwnd: ssthresh = inflight_pkts / 2, floor 2.
+        // pipe = 1 MSS -> 1/2 = 0 -> floor 2.
+        // raw distance = 8 MSS -> 8/2 = 4.
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        std::fprintf(stderr, "[B5D3] after RTO ssthresh=%u (raw-distance value would be 4)\n",
+                     h.conn.Ssthresh());
+        CHECK(2u == h.conn.Ssthresh());
+    }
+
     void TestKccPipeExcludesLost() {
         // Fully-lost flight, retransmitted: the TX_START gate must see the
         // pre-retransmission pipe (kernel tcp_event_data_sent runs INSIDE
@@ -3123,16 +3320,19 @@ namespace {
         CHECK(1u == xtcp::cc::KccTestIsNextCyclePhase(&d.sk, &rs, after_full_length));
 
         // (d) B8-D3: the pre-ACK in-flight must also be adjusted by the
-        // pacing-queue EDT credit. One segment below the probe-up target,
-        // the credit-free path (plus the one-segment gain headroom) reaches
-        // the target and ends the phase; exactly one credited segment pushes
-        // it back below the target, so the phase must NOT end. Forcing the
-        // edt_us argument to 0 (the old wiring-removal mutant) flips the
-        // second row to 1 and fails here.
-        CHECK(target > kMss);
-        CHECK(target - kMss <= 0xFFFFFFFFull);
+        // pacing-queue EDT credit. The gain headroom is kcc_tso_segs_goal
+        // (>= 1 segment, audit B6-D3), so place the pre-ACK value one
+        // headroom below the target: the credit-free path reaches the target
+        // and ends the phase; exactly one credited segment pushes it back
+        // below the target, so the phase must NOT end. Forcing the edt_us
+        // argument to 0 (the old wiring-removal mutant) flips the second row
+        // to 1 and fails here.
+        const UInt32 headroom = xtcp::cc::KccTestTsoSegsGoal(&d.sk);
+        CHECK(1 <= headroom);
+        CHECK(target > static_cast<UInt64>(headroom) * kMss);
         rs.lost = 0;
-        rs.prior_in_flight_bytes = static_cast<UInt32>(target - kMss);
+        rs.prior_in_flight_bytes =
+            static_cast<UInt32>(target - static_cast<UInt64>(headroom) * kMss);
         rs.pacing_edt_us = 0;
         CHECK(1u == xtcp::cc::KccTestIsNextCyclePhase(&d.sk, &rs, after_full_length));
         const UInt64 credit_us =
@@ -3407,6 +3607,38 @@ namespace {
             d.Round(20000);
             CheckFullSnapshot(d);
             CHECK(kcc_core_cwnd_segs(&d.ref) == static_cast<s64>(d.sk.snd_cwnd));
+        }
+
+        // B8-D8: CA_CWR (2) must be exercised too, otherwise the CWR branch of
+        // kcc_set_cwnd_to_recover_or_restore (and the packet_conservation gate
+        // keyed on `ca_state == 3`) is never driven and the 37-field
+        // differential is a tautology for those rows. CWR -> Recovery must
+        // NOT latch conservation again (the reduction snapshot already
+        // exists), and CWR -> Open must restore prior_cwnd.
+        {
+            Driver c(0, 0, 2);
+            for (UInt32 i = 0; i < 6; ++i) {
+                c.Round(20000);
+            }
+            const UInt32 cwnd_before = c.sk.snd_cwnd;
+            c.SetCaState(2);             // CA_CWR
+            for (UInt32 i = 0; i < 8; ++i) {
+                c.Round(20000);
+                CheckFullSnapshot(c);
+                CHECK(kcc_core_cwnd_segs(&c.ref) == static_cast<s64>(c.sk.snd_cwnd));
+            }
+            // CWR is not a "first Recovery entry": conservation stays 0.
+            CHECK(0u == c.Snap().packet_conservation);
+            CHECK(2u == c.Snap().ca_state);
+            // CWR -> Open does NOT restore prior_cwnd: the kernel gate is
+            // `prev_state >= TCP_CA_Recovery` (3), and CWR is 2
+            // (tcp_kcc.c:4006). The window simply keeps growing.
+            c.SetPriorCwnd(cwnd_before + 20);
+            c.SetCaState(0);
+            c.Round(20000);
+            CheckFullSnapshot(c);
+            CHECK(static_cast<UInt32>(cwnd_before + 20) != c.sk.snd_cwnd);
+            CHECK(kcc_core_cwnd_segs(&c.ref) == static_cast<s64>(c.sk.snd_cwnd));
         }
 
         // B8-D4: kernel kcc_set_cwnd_to_recover_or_restore restores
@@ -3841,6 +4073,7 @@ int main() {
     TestKccFullBwThresholdMatchesKernel();
     TestKccProbeCycleAdvances();
     TestKccPacingExtremeClamp();
+    TestKccMaxPacingRateClamp();
     TestKccBdpSaturation();
     TestKccPacingUnitGrid();
     TestKccBdpConfirmedBaseline();
@@ -3876,9 +4109,11 @@ int main() {
     TestApplyCheckpointResetsCongestionView();
     TestApplyCheckpointFullReset();
     TestRackDoesNotReenterLoss();
+    TestRackDoesNotRecutInCwr();
     TestRackKeepsRtoSnapshot();
     TestMigrationResetsKccRecoveryState();
     TestKccPipeExcludesLost();
+    TestCcInflightExcludesSacked();
     TestKccTxStartOnTlp();
     TestKccDsackCountsDelivered();
     TestKccCycleUsesPriorInflight();

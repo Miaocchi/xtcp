@@ -81,6 +81,16 @@
 #define MICROS_PER_SECOND 1000000LL
 #define MIN_RTT_UNINIT 0xFFFFFFFFu
 
+/* Kernel TSO headroom constants (tcp_kcc.c:3035-3069). */
+#define KCC_MIN_TSO_RATE 1200000
+#define KCC_MIN_TSO_RATE_DIV 8
+#define KCC_TSO_HEADROOM_MULT 3
+#define KCC_TSO_MAX_SEGS 127
+#define KCC_TSO_SEGS_LOW 1
+#define KCC_TSO_SEGS_DEFAULT 2
+#define KCC_TSO_HIGH_JITTER_THRESH_US 4000
+#define KCC_TSO_DIV_HALVE_SHIFT 1
+
 #define KCC_MODE_STARTUP 0
 #define KCC_MODE_PROBE_BW 1
 #define KCC_MODE_DRAIN 2
@@ -164,6 +174,11 @@ struct kcc_core {
 	u32  prev_ca_state;
 	u32  prior_cwnd;
 	u32  packet_conservation;
+
+	/* Kernel sk->sk_max_pacing_rate: the ceiling kcc_bw_to_pacing_rate
+	 * applies to every rate it produces (tcp_kcc.c:3563-3567). ~0 = none,
+	 * matching the kernel default. */
+	u64  max_pacing_rate;
 
 	/* Outputs */
 	s64  pacing_rate_bytes_per_second;
@@ -593,26 +608,70 @@ static u32 kcc_get_cycle_pacing_gain(const struct kcc_core *k) {
 	}
 }
 
-/* Kernel kcc_packets_in_net_at_edt (tcp_kcc_c8bead4.c:5016-5037):
+/* Kernel kcc_packets_in_net_at_edt (tcp_kcc.c:5016-5037):
  *
  *   interval_us        = (edt - now) in MICROSECONDS
- *   interval_delivered = (bw * interval_us) >> BW_SCALE
- *   inflight_at_edt    = inflight_pkts + (gain > BBR_UNIT ? 1 : 0)
+ *   interval_delivered = (bw * interval_us) >> BW_SCALE   (truncated to u32)
+ *   inflight_at_edt    = inflight_pkts + (gain > BBR_UNIT ? tso_segs_goal : 0)
  *   credit >= inflight_at_edt -> 0
  *   else (inflight_at_edt - credit) * mss
  *
  * The kernel counts packets; callers here compare against kcc_bdp_bytes, so
  * the packet result is scaled back to bytes with mss. edt_us is the pacing
  * queue depth (tp->tcp_wstamp_ns - now, microseconds). */
+
+/* Kernel kcc_quantization_budget (tcp_kcc.c:3859-3864):
+ *   cwnd += KCC_TSO_HEADROOM_MULT * kcc_tso_segs_goal(sk);
+ *   cwnd  = (cwnd + 1) & ~1U;
+ * kcc_inflight() = kcc_quantization_budget(kcc_bdp(...)), and both the DRAIN
+ * target and its ssthresh go through it (audit B6-D2). */
+static u64 kcc_quantization_budget(u64 cwnd, u32 tso_segs_goal) {
+	return (cwnd + (u64)KCC_TSO_HEADROOM_MULT * tso_segs_goal + 1) & ~(u64)1;
+}
+
+/* Kernel kcc_tso_segs_goal (tcp_kcc.c:3689-3697) with the port's pinned
+ * defaults (no sk_pacing_shift / GSO_MAX_SIZE socket fields):
+ *   bytes = min(pacing_rate >> 10, 65536 - 1 - 120)
+ *   segs  = max(bytes / mss, min_tso_segs), capped at 127
+ * kcc_min_tso_segs (tcp_kcc.c:3651-3672): 1 below KCC_MIN_TSO_RATE/div,
+ * 2 at or above it, with div halved (8 -> 4) under high jitter. */
+static u32 kcc_tso_segs_goal(const struct kcc_core *k) {
+	u32 div = KCC_MIN_TSO_RATE_DIV;
+	u64 bytes;
+	u64 segs;
+	u32 min_segs;
+	u64 thresh;
+
+	if (k->jitter_ewma > KCC_TSO_HIGH_JITTER_THRESH_US) {
+		div = (div >> KCC_TSO_DIV_HALVE_SHIFT) > 0
+			? (div >> KCC_TSO_DIV_HALVE_SHIFT) : 1;
+	}
+	thresh = (KCC_MIN_TSO_RATE / div) > 0 ? (KCC_MIN_TSO_RATE / div) : 1;
+	min_segs = ((u64)k->pacing_rate_bytes_per_second < thresh)
+		? KCC_TSO_SEGS_LOW : KCC_TSO_SEGS_DEFAULT;
+
+	bytes = (u64)k->pacing_rate_bytes_per_second >> 10;
+	if (bytes > (u64)(65536 - 1 - 120)) bytes = (u64)(65536 - 1 - 120);
+	if (0 == k->mss) return min_segs;
+	segs = bytes / k->mss;
+	if (segs < min_segs) segs = min_segs;
+	return (segs > KCC_TSO_MAX_SEGS) ? (u32)KCC_TSO_MAX_SEGS : (u32)segs;
+}
+
 static u64 kcc_packets_in_net_at_edt(u64 inflight_bytes, u32 gain, u32 mss,
-				     u64 bw_pkts, u32 edt_us) {
+				     u64 bw_pkts, u32 edt_us, u32 tso_segs_goal) {
 	u64 unit = (mss > 0) ? mss : 1460u;
 	u64 inflight_pkts = (inflight_bytes + unit - 1) / unit;
-	u64 credit;
-	if (gain > BBR_UNIT) inflight_pkts += 1;
-	credit = (bw_pkts * (u64)edt_us) >> BW_SCALE;
-	if (credit >= inflight_pkts) return 0;
-	return (inflight_pkts - credit) * unit;
+	u32 credit;
+	if (gain > BBR_UNIT) inflight_pkts += tso_segs_goal;
+	/* Kernel: u32 interval_delivered = (u64)kcc_bw * interval_us >> BW_SCALE
+	 * - the product truncates to u32 (tcp_kcc.c:5023-5024). */
+	{
+		u64 c = (bw_pkts * (u64)edt_us) >> BW_SCALE;
+		credit = (c > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (u32)c;
+	}
+	if ((u64)credit >= inflight_pkts) return 0;
+	return (inflight_pkts - (u64)credit) * unit;
 }
 
 static int kcc_is_next_cycle_phase(const struct kcc_core *k, s64 now_us,
@@ -622,7 +681,7 @@ static int kcc_is_next_cycle_phase(const struct kcc_core *k, s64 now_us,
 	int is_full_length = elapsed > k->min_rtt_us;
 	u32 gain = kcc_get_cycle_pacing_gain(k);
 	u64 inflight = kcc_packets_in_net_at_edt(flight_bytes, gain, k->mss,
-					     (u64)k->max_bw, edt_us);
+					     (u64)k->max_bw, edt_us, kcc_tso_segs_goal(k));
 	u64 target;
 
 	if (gain == BBR_UNIT) {
@@ -741,15 +800,22 @@ static void kcc_update_model(struct kcc_core *k, const struct kcc_ack_input *in)
 		k->mode = KCC_MODE_DRAIN;
 		k->drain_enter_stamp_us = (u64)now_us;
 		if (k->mss > 0) {
-			u64 segs = kcc_bdp_packets((u64)k->max_bw, k->min_rtt_us, BBR_UNIT);
+			/* Kernel kcc_check_drain: snd_ssthresh = kcc_inflight(...), i.e. the
+			 * BDP WITH the quantization budget (audit B6-D2). */
+			u64 segs = kcc_quantization_budget(
+				kcc_bdp_packets((u64)k->max_bw, k->min_rtt_us, BBR_UNIT),
+				kcc_tso_segs_goal(k));
 			if (segs > 0x7FFFFFFFull) segs = 0x7FFFFFFFull;
 			k->snd_ssthresh = (u32)segs;
 		}
 	}
 	if (k->mode == KCC_MODE_DRAIN) {
 		u64 inflight = kcc_packets_in_net_at_edt((u64)flight_bytes, k->pacing_gain,
-						k->mss, (u64)k->max_bw, in->edt_us);
-		u64 bdp = kcc_bdp_bytes((u64)k->max_bw, k->min_rtt_us, BBR_UNIT, k->mss);
+						k->mss, (u64)k->max_bw, in->edt_us, kcc_tso_segs_goal(k));
+		/* Kernel comparison target is kcc_inflight (BDP + budget). */
+		u64 bdp = kcc_quantization_budget(
+			kcc_bdp_packets((u64)k->max_bw, k->min_rtt_us, BBR_UNIT),
+			kcc_tso_segs_goal(k)) * (u64)((k->mss > 0) ? k->mss : 1460u);
 		u64 elapsed = (now_us > (s64)k->drain_enter_stamp_us)
 			? (u64)(now_us - (s64)k->drain_enter_stamp_us) : 0;
 		u64 min_rtt = (k->min_rtt_us == MIN_RTT_UNINIT) ? 0 : k->min_rtt_us;
@@ -813,9 +879,16 @@ static void kcc_set_pacing_rate(struct kcc_core *k, u64 bw, s32 gain) {
 		if (boot_rate > rate) rate = boot_rate;
 	}
 	if (k->full_bw_reached) {
-		k->pacing_rate_bytes_per_second = (s64)rate;
-	} else if (rate > (u64)k->pacing_rate_bytes_per_second) {
-		k->pacing_rate_bytes_per_second = (s64)rate;
+		k->pacing_rate_bytes_per_second =
+			(s64)((rate < k->max_pacing_rate) ? rate : k->max_pacing_rate);
+	} else {
+		/* Kernel kcc_bw_to_pacing_rate clamps EVERY rate it returns with
+		 * min_t(u64, rate, sk->sk_max_pacing_rate) (tcp_kcc.c:3563-3567),
+		 * so the monotonic gate compares capped values. */
+		u64 capped = (rate < k->max_pacing_rate) ? rate : k->max_pacing_rate;
+		if (capped > (u64)k->pacing_rate_bytes_per_second) {
+			k->pacing_rate_bytes_per_second = (s64)capped;
+		}
 	}
 }
 
@@ -828,7 +901,10 @@ static void kcc_set_cwnd(struct kcc_core *k, u64 bw, s32 gain, s64 acked,
 
 	if (acked > 0) {
 		if (losses > 0) {
-			u64 lost_pkts = ((u64)losses + mss - 1) / mss;
+			/* Kernel kcc_set_cwnd (tcp_kcc.c:3992-3998) subtracts
+			 * rs->losses, which is already a PACKET count
+			 * (tcp_input_66.c:3936). No byte->packet rounding here. */
+			u64 lost_pkts = (u64)losses;
 			cwnd = (lost_pkts < cwnd)
 				? cwnd - lost_pkts
 				: (u64)KCC_CWND_ABSOLUTE_MIN;
@@ -900,6 +976,7 @@ void kcc_core_init(struct kcc_core *k) {
 	k->drain_enter_stamp_us = 0;
 	k->next_rtt_delivered = 0;
 	k->snd_ssthresh = 0x7FFFFFFFu;
+	k->max_pacing_rate = ~(u64)0;  /* kernel default: no cap */
 }
 
 void kcc_core_set_random_seed(struct kcc_core *k, u32 seed) {

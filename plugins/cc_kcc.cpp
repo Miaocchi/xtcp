@@ -380,6 +380,27 @@ namespace {
     }
 
     /**
+     * @brief Kernel kcc_quantization_budget (tcp_kcc.c:3859-3864):
+     *          cwnd += KCC_TSO_HEADROOM_MULT * kcc_tso_segs_goal(sk);
+     *          cwnd  = (cwnd + 1) & ~1U;
+     *
+     * The DRAIN target and its ssthresh both go through this budget in the
+     * kernel (kcc_inflight -> kcc_quantization_budget), so the port's DRAIN
+     * gate must use it too; without it the port exits DRAIN one TSO burst
+     * too early (audit B6-D2).
+     */
+    UInt64 QuantizationBudget(UInt64 pkts, UInt32 tso_segs_goal) noexcept {
+        const UInt64 with_headroom = pkts + 3ull * tso_segs_goal;
+        return (with_headroom + 1ull) & ~UInt64(1);
+    }
+
+    /** @brief Kernel kcc_inflight: BDP plus the TSO/quantization headroom. */
+    UInt64 BdpInflightPkts(UInt64 bw, UInt32 min_rtt_us, UInt32 gain,
+                           UInt32 tso_segs_goal) noexcept {
+        return QuantizationBudget(BdpPackets(bw, min_rtt_us, gain), tso_segs_goal);
+    }
+
+    /**
      * @brief Kernel kcc_packets_in_net_at_edt: inflight adjusted for the
      *        pacing queue between now and the earliest departure time
      *        (tcp_kcc_c8bead4.c:5016-5037).
@@ -398,15 +419,73 @@ namespace {
      * xtcp (NowUs() is duration_cast<microseconds>; pacing_deadline_ is
      * now + len*1e6/pacing_rate).
      */
+    /**
+     * @brief Kernel kcc_tso_segs_goal (tcp_kcc.c:3689-3697) for the port's
+     *        flat pacing model.
+     *
+     *   bytes = min(pacing_rate >> pacing_shift, GSO_MAX_SIZE - 1 - MAX_TCP_HEADER)
+     *   segs  = max(bytes / mss, min_tso_segs)
+     *   segs  = min(segs, KCC_TSO_MAX_SEGS)
+     *
+     * The port has no sk_pacing_shift / GSO_MAX_SIZE socket fields, so the
+     * kernel defaults are pinned here (pacing_shift = 10, i.e. a ~1 ms
+     * budget; GSO_MAX_SIZE = 65536; MAX_TCP_HEADER = 120). kcc_min_tso_segs
+     * is 1 below KCC_MIN_TSO_RATE/div and 2 above it
+     * (tcp_kcc.c:3651-3672), with div halved under high jitter.
+     */
+    UInt32 TsoSegsGoal(const KccState* k, UInt32 mss, UInt64 pacing_rate) noexcept {
+        constexpr UInt64 kGsoMaxSize = 65536;
+        constexpr UInt64 kMaxTcpHeader = 120;
+        constexpr UInt32 kPacingShift = 10;
+        constexpr UInt64 kMinTsoRate = 1200000;
+        constexpr UInt32 kMinTsoRateDiv = 8;
+        constexpr UInt32 kTsoHighJitterUs = 4000;
+        constexpr UInt32 kTsoSegsLow = 1;
+        constexpr UInt32 kTsoSegsDefault = 2;
+        constexpr UInt32 kTsoMaxSegs = 127;
+
+        UInt32 div = kMinTsoRateDiv;
+        if (kTsoHighJitterUs < k->jitter_ewma) {
+            div = (1 < (div >> 1)) ? (div >> 1) : 1;
+        }
+        const UInt64 thresh = (kMinTsoRate / div > 0) ? (kMinTsoRate / div) : 1;
+        const UInt32 min_segs =
+            (pacing_rate < thresh) ? kTsoSegsLow : kTsoSegsDefault;
+
+        UInt64 bytes = pacing_rate >> kPacingShift;
+        const UInt64 cap = kGsoMaxSize - 1 - kMaxTcpHeader;
+        if (cap < bytes) {
+            bytes = cap;
+        }
+        if (0 == mss) {
+            return min_segs;
+        }
+        UInt64 segs = bytes / mss;
+        if (segs < min_segs) {
+            segs = min_segs;
+        }
+        return (segs > kTsoMaxSegs) ? kTsoMaxSegs : static_cast<UInt32>(segs);
+    }
+
     UInt64 PacketsInNetAtEdt(UInt64 inflight_bytes, UInt32 gain, UInt32 mss,
-                             UInt64 bw_pkts, UInt32 edt_us) noexcept {
+                             UInt64 bw_pkts, UInt32 edt_us,
+                             UInt32 tso_segs_goal) noexcept {
         const UInt64 unit = (0 < mss) ? mss : 1460u;
         UInt64 inflight_pkts = (inflight_bytes + unit - 1) / unit;
         if (gain > 256) {
-            inflight_pkts += 1;   /* kcc_tso_segs_goal >= 1 segment */
+            // Kernel kcc_packets_in_net_at_edt (tcp_kcc.c:5027-5029):
+            //   if (kcc->pacing_gain > BBR_UNIT)
+            //       inflight_at_edt += kcc_tso_segs_goal(sk);
+            // Not a hardcoded 1: the goal scales with the pacing rate
+            // (audit B6-D3).
+            inflight_pkts += tso_segs_goal;
         }
-        // Kernel kcc_bw(sk) * interval_us >> BW_SCALE (packet domain).
-        const UInt64 credit = (bw_pkts * static_cast<UInt64>(edt_us)) >> 24;
+        // Kernel: u32 interval_delivered = (u64)kcc_bw(sk) * interval_us
+        // >> BW_SCALE - the product is truncated to u32 (audit B6-D4).
+        const UInt64 credit64 = (bw_pkts * static_cast<UInt64>(edt_us)) >> 24;
+        const UInt32 credit = (credit64 > 0xFFFFFFFFull)
+            ? 0xFFFFFFFFu
+            : static_cast<UInt32>(credit64);
         if (credit >= inflight_pkts) {
             return 0;
         }
@@ -451,9 +530,16 @@ namespace {
             }
         }
         if (k->full_bw_reached) {
-            sk->pacing_rate = rate;
-        } else if (rate > sk->pacing_rate) {
-            sk->pacing_rate = rate;
+            sk->pacing_rate = (rate < sk->max_pacing_rate) ? rate : sk->max_pacing_rate;
+        } else {
+            // Kernel kcc_bw_to_pacing_rate clamps EVERY rate it produces with
+            // min_t(u64, rate, sk->sk_max_pacing_rate) (tcp_kcc.c:3563-3567),
+            // so a user SO_MAX_PACING_RATE caps the STARTUP ramp and the
+            // monotonic gate below compares capped values.
+            const UInt64 capped = (rate < sk->max_pacing_rate) ? rate : sk->max_pacing_rate;
+            if (capped > sk->pacing_rate) {
+                sk->pacing_rate = capped;
+            }
         }
     }
 
@@ -756,9 +842,9 @@ namespace {
         // post-ACK sk->inflight.
         // Kernel kcc_is_next_cycle_phase -> kcc_packets_in_net_at_edt with
         // rs->prior_in_flight and the current pacing queue depth.
-        const UInt64 inflight = PacketsInNetAtEdt(rs->prior_in_flight_bytes, gain,
-                                                  sk->mss, k->max_bw,
-                                                  rs->pacing_edt_us);
+        const UInt64 inflight = PacketsInNetAtEdt(
+            rs->prior_in_flight_bytes, gain, sk->mss, k->max_bw,
+            rs->pacing_edt_us, TsoSegsGoal(k, sk->mss, sk->pacing_rate));
         if (gain > 256) {
             const UInt64 target = BdpBytes(k->max_bw, k->min_rtt_us, gain, sk->mss);
             return (full_len && (0 < rs->lost || inflight >= target)) ||
@@ -910,11 +996,14 @@ namespace {
         }
 
         // ---- 4. DRAIN entry/exit (kernel kcc_check_drain) ----
+        const UInt32 tso_goal = TsoSegsGoal(k, sk->mss, sk->pacing_rate);
         if (kModeStartup == k->mode && 0 != k->full_bw_reached) {
             k->mode = kModeDrain;
             k->drain_enter_stamp_us = now_us;
             if (0 < sk->mss) {
-                UInt64 segs = BdpPackets(k->max_bw, k->min_rtt_us, 256);
+                // Kernel kcc_check_drain: snd_ssthresh = kcc_inflight(...),
+                // i.e. the BDP WITH the quantization budget (audit B6-D2).
+                UInt64 segs = BdpInflightPkts(k->max_bw, k->min_rtt_us, 256, tso_goal);
                 if (segs > 0x7FFFFFFFull) {
                     segs = 0x7FFFFFFFull;
                 }
@@ -927,8 +1016,11 @@ namespace {
             // through kcc_packets_in_net_at_edt.
             const UInt64 inflight =
                 PacketsInNetAtEdt(sk->inflight, k->pacing_gain, sk->mss,
-                                   k->max_bw, rs->pacing_edt_us);
-            const UInt64 bdp = BdpBytes(k->max_bw, k->min_rtt_us, 256, sk->mss);
+                                   k->max_bw, rs->pacing_edt_us, tso_goal);
+            // The comparison target is kcc_inflight (BDP + quantization
+            // budget), not the bare BDP (audit B6-D2).
+            const UInt64 bdp = BdpInflightPkts(k->max_bw, k->min_rtt_us, 256, tso_goal) *
+                               ((0 < sk->mss) ? sk->mss : 1460u);
             const UInt64 elapsed = (now_us > k->drain_enter_stamp_us)
                 ? (now_us - k->drain_enter_stamp_us) : 0;
             const UInt64 min_rtt = (kMinRttUninit == k->min_rtt_us) ? 0 : k->min_rtt_us;
@@ -987,8 +1079,13 @@ namespace {
         UInt64 cwnd_pkts = sk->snd_cwnd;
         bool conserve = false;
         if (0 < acked) {
-            if (0 < rs->lost) {
-                const UInt64 lost_pkts = (static_cast<UInt64>(rs->lost) + mss - 1) / mss;
+            // Kernel kcc_set_cwnd (tcp_kcc.c:3992-3998):
+            //   if (rs->losses > 0) cwnd -= rs->losses;
+            // rs->losses is the PACKET count of freshly lost segments
+            // (tcp_input_66.c:3936), so the port must not round a byte total
+            // up here - a 2*MSS loss and a 1-byte loss are 2 vs 1 packets.
+            if (0 < rs->lost_pkts) {
+                const UInt64 lost_pkts = static_cast<UInt64>(rs->lost_pkts);
                 cwnd_pkts = (cwnd_pkts > lost_pkts)
                     ? cwnd_pkts - lost_pkts
                     : static_cast<UInt64>(kCwndAbsoluteMin);
@@ -1246,9 +1343,22 @@ namespace xtcp {
             return IsNextCyclePhase(k, sk, rs, now_us) ? 1u : 0u;
         }
 
+        UInt32 KccTestTsoSegsGoal(XtcpConnCc* sk) noexcept {
+            if (NULLPTR == sk) {
+                return 1;
+            }
+            const KccState* k = Priv(sk);
+            if (NULLPTR == k) {
+                return 1;
+            }
+            return TsoSegsGoal(k, sk->mss, sk->pacing_rate);
+        }
+
         UInt64 KccTestPacketsInNetAtEdt(UInt64 inflight_bytes, UInt32 gain, UInt32 mss,
-                                        UInt64 bw_pkts, UInt32 edt_us) noexcept {
-            return PacketsInNetAtEdt(inflight_bytes, gain, mss, bw_pkts, edt_us);
+                                        UInt64 bw_pkts, UInt32 edt_us,
+                                        UInt32 tso_segs_goal) noexcept {
+            return PacketsInNetAtEdt(inflight_bytes, gain, mss, bw_pkts, edt_us,
+                                     tso_segs_goal);
         }
 
         /**

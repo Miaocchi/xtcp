@@ -1246,6 +1246,11 @@ namespace xtcp {
                 rs.delivered_total_pkts = cc_.delivered_pkts;
                 rs.prior_in_flight_bytes = prior_in_flight_bytes;
                 rs.pacing_edt_us = PacingEdtUs(now);
+                // Kernel CC hooks read tcp_packets_in_flight(tp) LIVE. The
+                // cached cc_.inflight is only refreshed on transmit, so a SACK
+                // that retired segments would leave it inflated for KCC's
+                // packet_conservation / DRAIN gates (audit B5-D3 / B6-D1).
+                cc_.inflight = PipeInFlightBytes();
                 cc::ApplyRateSample(&cc_, cc_ops_, &rs, ack);
             } else {
                 const UInt32 interval_us = static_cast<UInt32>(
@@ -1261,7 +1266,9 @@ namespace xtcp {
                     const UInt32 lost_report = (cc_.lost > 0xFFFFFFFFull)
                         ? 0xFFFFFFFFu
                         : static_cast<UInt32>(cc_.lost);
+                    const UInt32 lost_pkts_report = cc_.lost_pkts;
                     cc_.lost = 0;
+                    cc_.lost_pkts = 0;
                     cc::RateSample rs;
                     rs.acked = acked;
                     rs.delivered = (delivered_delta > 0xFFFFFFFFull)
@@ -1269,6 +1276,7 @@ namespace xtcp {
                         : static_cast<UInt32>(delivered_delta);
                     rs.rtt_us = rtt_sample;
                     rs.lost = lost_report;
+                    rs.lost_pkts = lost_pkts_report;
                     // Bandwidth = delivered / interval (KCC/BBR need
                     // the real elapsed time between rate samples).
                     rs.interval_us = interval_us;
@@ -1285,6 +1293,9 @@ namespace xtcp {
                     rs.delivered_total_pkts = cc_.delivered_pkts;
                     rs.prior_in_flight_bytes = prior_in_flight_bytes;
                     rs.pacing_edt_us = PacingEdtUs(now);
+                    // See the note in the degenerate-sample branch: the CC
+                    // hooks consume the live pipe, not a stale scalar.
+                    cc_.inflight = PipeInFlightBytes();
                     last_rate_sample_ = now;
                     last_delivered_ = cc_.delivered;
                     last_delivered_pkts_ = cc_.delivered_pkts;
@@ -1458,6 +1469,10 @@ namespace xtcp {
                 // and reset there).
                 if (1 == seg.retries) {
                     cc_.lost += seg.len;
+                    // Packet-domain twin (kernel tp->lost): KCC subtracts
+                    // rs->losses from cwnd directly, so the count must be
+                    // segments, not a byte total rounded up later.
+                    cc_.lost_pkts += seg.pkt_count;
                 }
                 // Karn (RFC 6298): a retransmitted segment must NOT contribute
                 // an RTT sample - its ACK cannot distinguish the first send
@@ -2349,7 +2364,13 @@ namespace xtcp {
         void TcpConn::CutCwnd() noexcept {
             // RFC 5681: ssthresh = max(FlightSize/2, 2*SMSS) on loss. Packets
             // units: half of the in-flight window, at least two segments.
-            UInt32 inflight_pkts = (cc_.inflight + peer_mss_ - 1) / peer_mss_;
+            // Kernel tcp_enter_loss reads tcp_packets_in_flight() LIVE, not a
+            // cached scalar: SACKed and LOST bytes left the network, so the
+            // reduction must not be computed from the raw sequence distance
+            // (audit B5-D3). cc_.inflight is only refreshed on transmit and
+            // goes stale the moment a SACK block retires a segment.
+            const UInt32 pipe_bytes = PipeInFlightBytes();
+            UInt32 inflight_pkts = (pipe_bytes + peer_mss_ - 1) / peer_mss_;
             UInt32 ssthresh = inflight_pkts / 2;
             if (ssthresh < 2) {
                 ssthresh = 2;
@@ -2371,7 +2392,7 @@ namespace xtcp {
                 if (NULLPTR != cc_ops_->cwnd_event) {
                     cc_ops_->cwnd_event(&cc_, cc::kCaEventLoss);
                 }
-                const UInt32 inflight_now = (cc_.inflight + peer_mss_ - 1) / peer_mss_;
+                const UInt32 inflight_now = (pipe_bytes + peer_mss_ - 1) / peer_mss_;
                 cc_.snd_cwnd = (0 < inflight_now) ? inflight_now + 1 : 1;
             } else {
                 cc_.snd_ssthresh = ssthresh;
@@ -2584,6 +2605,8 @@ namespace xtcp {
                             // cwnd; reported once on the next rate sample.
                             if (1 == seg.retries) {
                                 cc_.lost += tx_len;
+                                // Packet-domain twin (see RetransmitFront).
+                                cc_.lost_pkts += PktCount(tx_len, peer_mss_);
                             }
                             // Karn (RFC 6298): never RTT-sample a retransmitted
                             // segment (the ACK is ambiguous), or srtt/min_rtt (and
@@ -2760,9 +2783,12 @@ namespace xtcp {
             }
             // Kernel rs->prior_in_flight (tcp_input.c:3839): the in-flight
             // bytes BEFORE this ACK cleans the retransmission queue. The
-            // PROBE_BW cycle-phase test consumes it.
+            // PROBE_BW cycle-phase test consumes it. It is
+            // tcp_packets_in_flight(), i.e. SACKed and LOST bytes are NOT in
+            // the network (audit B5-D3): using the raw snd_nxt-snd_una
+            // distance makes the DRAIN/cycle gates see an inflated pipe.
             const UInt64 prior_in_flight_bytes =
-                static_cast<UInt64>(snd_nxt_ - snd_una_);
+                static_cast<UInt64>(PipeInFlightBytes());
             // Delivery snapshot at ACK entry: a duplicate ACK whose only
             // progress is SACK/DSACK still advances tp->delivered in the
             // kernel (tcp_input.c:3879-3881), so the dup-ACK path must
@@ -3321,7 +3347,13 @@ namespace xtcp {
                 // Kernel ordering: tp->delivered/inflight advance BEFORE the
                 // ACK-triggered output, so segments emitted by the flush carry
                 // the post-ACK delivered snapshot (rate_sample tx.delivered).
-                cc_.inflight = snd_nxt_ - snd_una_;
+                // Kernel tcp_packets_in_flight(tp) = packets_out - (sacked_out + lost_out)
+                // + retrans_out (tcp_h_66.h:1198-1220). The raw snd_nxt-snd_una
+                // distance counts SACKed and LOST bytes as in flight, so every
+                // CC consumer (tcp_cwnd_reduction's cwnd = inflight + sndcnt,
+                // KCC packet_conservation, BBR's bdp gate) saw an inflated
+                // pipe during recovery (audit B5-D3 / B6-D1).
+                cc_.inflight = PipeInFlightBytes();
                 cc_.delivered += acked;
                 // Packet-domain twin (kernel tp->delivered): pkts_acked is
                 // the sum of tcp_skb_pcount over the cleaned skbs. The SACK
@@ -4182,7 +4214,13 @@ namespace xtcp {
             if (sink_) {
                 sink_(retrans_queue_.back().data.Clone());
             }
-            cc_.inflight = snd_nxt_ - snd_una_;
+            // Kernel tcp_packets_in_flight(tp) = packets_out - (sacked_out + lost_out)
+                // + retrans_out (tcp_h_66.h:1198-1220). The raw snd_nxt-snd_una
+                // distance counts SACKed and LOST bytes as in flight, so every
+                // CC consumer (tcp_cwnd_reduction's cwnd = inflight + sndcnt,
+                // KCC packet_conservation, BBR's bdp gate) saw an inflated
+                // pipe during recovery (audit B5-D3 / B6-D1).
+                cc_.inflight = PipeInFlightBytes();
             cc_.lsndtime = now / 1000;
             // Pace: schedule the next send len/rate microseconds later.
             if (0 < cc_.pacing_rate) {
@@ -4288,7 +4326,13 @@ namespace xtcp {
                             // advances snd_una_ and, once the window re-opens,
                             // stops persist.
                             snd_nxt_ += 1;
-                            cc_.inflight = snd_nxt_ - snd_una_;
+                            // Kernel tcp_packets_in_flight(tp) = packets_out - (sacked_out + lost_out)
+                // + retrans_out (tcp_h_66.h:1198-1220). The raw snd_nxt-snd_una
+                // distance counts SACKed and LOST bytes as in flight, so every
+                // CC consumer (tcp_cwnd_reduction's cwnd = inflight + sndcnt,
+                // KCC packet_conservation, BBR's bdp gate) saw an inflated
+                // pipe during recovery (audit B5-D3 / B6-D1).
+                cc_.inflight = PipeInFlightBytes();
                         } else {
                             // Unacked-data probe: re-probe the missing byte. It
                             // is already accounted in retrans_queue_ (no new
@@ -4679,7 +4723,13 @@ namespace xtcp {
                 if (sink_) {
                     sink_(retrans_queue_.back().data.Clone());  // transmit now (zero-copy retx ref held)
                 }
-                cc_.inflight = snd_nxt_ - snd_una_;
+                // Kernel tcp_packets_in_flight(tp) = packets_out - (sacked_out + lost_out)
+                // + retrans_out (tcp_h_66.h:1198-1220). The raw snd_nxt-snd_una
+                // distance counts SACKed and LOST bytes as in flight, so every
+                // CC consumer (tcp_cwnd_reduction's cwnd = inflight + sndcnt,
+                // KCC packet_conservation, BBR's bdp gate) saw an inflated
+                // pipe during recovery (audit B5-D3 / B6-D1).
+                cc_.inflight = PipeInFlightBytes();
                 cc_.lsndtime = now / 1000;
                 if (0 < cc_.pacing_rate) {
                     pacing_deadline_ = now + (static_cast<UInt64>(n) * 1000000ull) / cc_.pacing_rate;
