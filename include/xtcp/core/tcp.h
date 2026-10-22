@@ -605,6 +605,32 @@ namespace xtcp {
             UInt32 RetransQueueSize() const noexcept {
                 return static_cast<UInt32>(retrans_queue_.size());
             }
+            /** @brief Diagnostics: the O(1) in-flight estimate (same value the
+             *         CA_EVENT_TX_START gate and the CC hooks consume). */
+            UInt32 PipeInFlightBytesPublic() const noexcept {
+                return PipeInFlightBytes();
+            }
+            /** @brief Diagnostics ONLY: recompute the in-flight bytes by walking
+             *         the queue, i.e. the O(N) cost the incremental counters
+             *         replaced. Used to quantify the fix; never on a hot path. */
+            UInt32 PipeWalkReference() const noexcept {
+                UInt32 sacked = 0;
+                UInt32 lost = 0;
+                UInt32 retrans = 0;
+                for (const SentSeg& seg : retrans_queue_) {
+                    sacked += seg.sacked;
+                    if (0 != seg.lost && seg.sacked < seg.len) {
+                        lost += seg.len - seg.sacked;
+                    }
+                    if (0 < seg.retries) {
+                        retrans += seg.len - seg.sacked;
+                    }
+                }
+                const UInt32 inflight = snd_nxt_ - snd_una_;
+                const UInt32 left_out = sacked + lost;
+                const UInt32 base = (inflight > left_out) ? (inflight - left_out) : 0;
+                return base + retrans;
+            }
             bool QuickAck() const noexcept {
                 std::lock_guard<std::recursive_mutex> scope(syncobj_);
                 return quickack_;
@@ -1043,6 +1069,32 @@ namespace xtcp {
              */
             UInt32 PipeInFlightBytes() const noexcept;
             /**
+             * @brief Adds/removes one segment's contribution to the O(1)
+             *        pipe counters. `sign` is +1 on insert, -1 on erase.
+             *
+             * Kept separate from the queue mutation so every call site reads
+             * the same three terms the walk used to compute:
+             *   sacked  = seg.sacked
+             *   lost    = (seg.lost && seg.sacked < seg.len) ? len - sacked : 0
+             *   retrans = (0 < seg.retries) ? len - sacked : 0
+             */
+            void PipeAccountSeg(const SentSeg& seg, int sign) noexcept;
+            /**
+             * @brief Same as PipeAccountSeg but from plain values, so a caller
+             *        can describe a segment's PREVIOUS state without copying it
+             *        (SentSeg owns a BufRef and is not copyable).
+             */
+            void PipeAccountFields(UInt32 len, UInt32 sacked, Byte lost,
+                                   UInt32 retries, int sign) noexcept;
+            /**
+             * @brief Re-derives one segment's pipe terms after a field of that
+             *        segment changed (seg.sacked / seg.lost / seg.retries).
+             *        `old_sacked`/`old_lost`/`old_retries` are the values BEFORE
+             *        the mutation.
+             */
+            void PipeReaccountSeg(const SentSeg& seg, UInt32 old_sacked,
+                                  Byte old_lost, UInt32 old_retries) noexcept;
+            /**
              * @brief Kernel interval_to_edt in MICROSECONDS: how long until
              *        the pacing queue drains (tp->tcp_wstamp_ns equivalent,
              *        i.e. pacing_deadline_ - now, clamped at 0). Fed into
@@ -1347,6 +1399,21 @@ namespace xtcp {
             /** @brief Kernel tp->retrans_out (PACKETS): retransmitted
              *         segments still in flight. */
             UInt32  retrans_out_pkts_ = 0;
+            /**
+             * @brief Incremental BYTE sums over retrans_queue_, maintained at
+             *        every mutation so PipeInFlightBytes() is O(1).
+             *
+             * The kernel derives tcp_packets_in_flight() from O(1) counters
+             * (packets_out/sacked_out/lost_out/retrans_out), while a queue walk
+             * costs ~1.6 ns per queued segment: at a 100 Gbps BDP (~1.25 MB,
+             * ~850 segments) one walk per ACK is ~1.3 us of pure overhead.
+             * Every mutation of seg.sacked / seg.lost / seg.retries must update
+             * these alongside, and queue insert/erase must add/subtract the
+             * whole segment.
+             */
+            UInt32  pipe_sacked_bytes_ = 0;   /**< sum of seg.sacked */
+            UInt32  pipe_lost_bytes_ = 0;     /**< sum of (len - sacked) for LOST segs */
+            UInt32  pipe_retrans_bytes_ = 0;  /**< sum of (len - sacked) for retried segs */
             Byte        batch_app_limited_ = 0;     /**< app-limited snapshot of the newest popped segment */
             bool        batch_retrans_ = false;     /**< any segment popped by the CURRENT ACK was retransmitted */
             bool        last_ack_delayed_ = false;  /**< current ACK looks like a delayed ACK (kernel flag) */

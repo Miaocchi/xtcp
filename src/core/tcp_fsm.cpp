@@ -771,7 +771,7 @@ namespace xtcp {
                             out.sack[b][0] = Load32(data + off + 2 + b * 8);
                             out.sack[b][1] = Load32(data + off + 6 + b * 8);
                         }
-                        // RFC 2018 闂?: the first SACK block is the most
+                        // RFC 2018 间: the first SACK block is the most
                         // recently received block, so a compliant peer may
                         // send blocks most-recent-first. The sender-side
                         // recovery walk (RetransmitEarliestMissing) iterates
@@ -967,6 +967,10 @@ namespace xtcp {
                 rto_deadline_ = 0;
                 persist_deadline_ = 0;
                 retrans_queue_.clear();
+                // The O(1) pipe sums mirror the queue: drop them together.
+                pipe_sacked_bytes_ = 0;
+                pipe_lost_bytes_ = 0;
+                pipe_retrans_bytes_ = 0;
                 ack_pending_ = false;
                 ack_count_ = 0;
                 ack_deadline_ = 0;
@@ -1142,7 +1146,7 @@ namespace xtcp {
                 out[n * 2 + 1] = cur_right;
                 ++n;
             }
-            // RFC 2018 闂?: the first SACK block must be the most recently
+            // RFC 2018 间: the first SACK block must be the most recently
             // received block. ooo_ is keyed by seq (no insertion order), so
             // approximate "most recent" with the largest-seq block - the last
             // emitted (blocks above are ascending). Swap it into slot 0.
@@ -1330,7 +1334,7 @@ namespace xtcp {
                 rto_deadline_ = 0;
                 return;
             }
-            // RFC 1122 闂?.2.2.17: a retransmission must fit the peer's
+            // RFC 1122 间.2.2.17: a retransmission must fit the peer's
             // advertised window. A zero window takes no data - the persist
             // probe owns that state, so skip the transmit (re-arm below) and
             // wait for a window-opening ACK instead of emitting an out-of-
@@ -1349,7 +1353,11 @@ namespace xtcp {
                 // owns that state, and the window-ACK path clears the queue).
                 if (TcpState::kFinWait1 == state_ || TcpState::kLastAck == state_ ||
                     TcpState::kClosing == state_) {
+                    // retries 0 -> 1 makes the segment count as retransmitted in
+                    // the pipe sums, so re-account it.
+                    const UInt32 old_retries = seg.retries;
                     ++seg.retries;
+                    PipeReaccountSeg(seg, seg.sacked, seg.lost, old_retries);
                 }
                 rto_deadline_ = now + ((0 == seg.rto) ? rto_ : seg.rto);
                 timers_dirty_.store(true, std::memory_order_relaxed);
@@ -1437,7 +1445,12 @@ namespace xtcp {
                 // exhaustion -> empty copy) must NOT consume kMaxDataRetries:
                 // the connection and the network are healthy, the peer's
                 // window merely shrank below the queued segment length.
-                ++seg.retries;
+                {
+                    const UInt32 old_retries = seg.retries;
+                    ++seg.retries;
+                    // retries 0 -> 1 flips the pipe term for this segment.
+                    PipeReaccountSeg(seg, seg.sacked, seg.lost, old_retries);
+                }
                 ++retransmit_count_;
                 // Kernel tcp_rate_skb_sent refreshes tx.delivered on every
                 // (re)transmission; TCPCB_RETRANS marks the skb so the ACK
@@ -1544,6 +1557,10 @@ namespace xtcp {
             while (!retrans_queue_.empty()) {
                 SentSeg seg = std::move(retrans_queue_.front());
                 retrans_queue_.pop_front();
+                // Keep the O(1) pipe sums in step with the queue. The
+                // re-split segments are re-inserted below, so remove this one's
+                // contribution first.
+                PipeAccountSeg(seg, -1);
                 if (seg.len <= new_mss) {
                     resplit.push_back(std::move(seg));
                     continue;
@@ -1632,6 +1649,16 @@ namespace xtcp {
                 }
             }
             retrans_queue_ = std::move(resplit);
+            // Rebuild the O(1) pipe sums from the re-split queue. This path
+            // only runs on an MSS change (RFC 1191), never per packet, so a
+            // single walk here is free - and it keeps the incremental counters
+            // provably consistent with whatever the split produced.
+            pipe_sacked_bytes_ = 0;
+            pipe_lost_bytes_ = 0;
+            pipe_retrans_bytes_ = 0;
+            for (const SentSeg& rs : retrans_queue_) {
+                PipeAccountSeg(rs, +1);
+            }
         }
 
         void TcpConn::OnRetransmitTimer(TimePoint now) noexcept {
@@ -1698,7 +1725,7 @@ namespace xtcp {
                                       static_cast<UInt16>(window_ >> kWindowScaleOffer), sink_,
                                       kWindowScaleOffer, Md5Key(), Md5KeyLen(), NULLPTR, 0, NULLPTR);
                 }
-                // RFC 1122 闂?.2.3.5: handshake retransmits back off
+                // RFC 1122 间.2.3.5: handshake retransmits back off
                 // exponentially, mirroring RetransmitFront's seg.rto doubling
                 // (tcp_fsm.cpp:1075-1082) - a fixed rto_ re-arm fires the whole
                 // syn_retries_ budget at a constant 1 s (Linux ~127 s for 6
@@ -1737,7 +1764,7 @@ namespace xtcp {
                                   NULLPTR, 0, AdvertisedWindow(), sink_, rcv_wscale_,
                                   Md5Key(), Md5KeyLen(), NULLPTR, 0, cookie, false,
                                   false, 0, 0, !sack_ok_);
-                // RFC 1122 闂?.2.3.5: the SYN+ACK retransmit backs off
+                // RFC 1122 间.2.3.5: the SYN+ACK retransmit backs off
                 // exponentially (mirror of RetransmitFront seg.rto doubling,
                 // tcp_fsm.cpp:1075-1082), not a fixed rto_ re-arm.
                 syn_rto_ = (0 == syn_rto_) ? rto_ : syn_rto_;
@@ -1782,7 +1809,7 @@ namespace xtcp {
                 }
                 ++syn_retry_count_;
                 SendSegment(snd_nxt_ - 1, rcv_nxt_, kFlagFin | kFlagAck, NULLPTR, 0);
-                // RFC 1122 闂?.2.3.5: the FIN retransmit backs off exponentially
+                // RFC 1122 间.2.3.5: the FIN retransmit backs off exponentially
                 // (mirror of RetransmitFront seg.rto doubling, tcp_fsm.cpp:1081-1087). With a fixed rto_ re-arm the close gave up after
                 // 15 s (15 x 1 s); now it doubles 1,2,4,... capped at 60 s.
                 fin_rto_ = (0 == fin_rto_) ? rto_ : fin_rto_;
@@ -1849,6 +1876,8 @@ namespace xtcp {
                 if (0 == s.lost) {
                     s.lost = 1;
                     lost_out_pkts_ += s.pkt_count;
+                    // LOST takes the segment out of the pipe: re-account it.
+                    PipeReaccountSeg(s, s.sacked, 0, s.retries);
                 }
                 break;          // only the retransmission head is marked
             }
@@ -2504,7 +2533,7 @@ namespace xtcp {
                         // SACK block (stale, or landed exactly on a block's
                         // left edge after a single-segment gap retransmit):
                         // jump to the current gap's start - never retransmit
-                        // already-received data (RFC 6675 闂?).
+                        // already-received data (RFC 6675 间).
                         missing = static_cast<UInt32>(cursor);
                         break;
                     }
@@ -2539,14 +2568,14 @@ namespace xtcp {
                 // Find the queued segment covering the missing sequence.
                 for (SentSeg& seg : retrans_queue_) {
                     if (!SeqLt(missing, seg.seq) && SeqLt(missing, seg.seq + seg.len)) {
-                        // RFC 1122 闂?.2.2.17: the retransmission must fit the
+                        // RFC 1122 间.2.2.17: the retransmission must fit the
                         // peer's advertised window. A zero window takes no data -
                         // skip the transmit and wait for a window-opening ACK (the
                         // persist probe, when armed, re-arms the RTO path).
                         if (0 == snd_wnd_) {
                             return;
                         }
-                        // RFC 6675 闂?: retransmit ONLY the missing interval, not
+                        // RFC 6675 间: retransmit ONLY the missing interval, not
                         // the whole queued segment. When the missing point lies
                         // inside the segment, the prefix [seg.seq, missing) is
                         // already SACKed/delivered - resending it makes the peer
@@ -2626,7 +2655,12 @@ namespace xtcp {
                             // reference. Everything touching `seg` must therefore
                             // complete first; sink_ only needs the moved `copy`.
                             ++retransmit_count_;
-                            ++seg.retries;
+                            {
+                                const UInt32 old_retries = seg.retries;
+                                ++seg.retries;
+                                // retries 0 -> 1 flips the pipe term.
+                                PipeReaccountSeg(seg, seg.sacked, seg.lost, old_retries);
+                            }
                             // Loss signal: mark the segment's bytes lost on its
                             // FIRST retransmit only (kernel semantics: "lost" =
                             // newly marked lost since the last ACK). Repeated
@@ -2750,6 +2784,8 @@ namespace xtcp {
                     if (0 == seg.lost) {
                         seg.lost = 1;
                         lost_out_pkts_ += seg.pkt_count;
+                        // LOST takes the segment out of the pipe.
+                        PipeReaccountSeg(seg, seg.sacked, 0, seg.retries);
                     }
                     break;
                 }
@@ -2900,6 +2936,8 @@ namespace xtcp {
                             const UInt32 add = (ov < room) ? ov : room;
                             if (0 < add) {
                                 const UInt32 before = seg.sacked;
+                                const Byte before_lost = seg.lost;
+                                const UInt32 before_retries = seg.retries;
                                 seg.sacked += add;
                                 // Kernel tcp_sacktag_one counts a skb's pcount
                                 // ONCE, on its transition to TCPCB_SACKED_ACKED
@@ -2940,6 +2978,9 @@ namespace xtcp {
                                         }
                                     }
                                 }
+                                // seg.sacked (and possibly seg.lost) changed:
+                                // refresh the O(1) pipe sums for this segment.
+                                PipeReaccountSeg(seg, before, before_lost, before_retries);
                             }
                         }
                     }
@@ -3208,6 +3249,13 @@ namespace xtcp {
                                 cc_.snd_ssthresh = prior_ssthresh_;
                             }
                             episode_undone_ = true;  // kernel tcp_undo_cwnd_reduction
+                            // Kernel tcp_try_undo_loss (tcp_input_66.c:2608):
+                            // a successful loss undo zeroes icsk_retransmits,
+                            // so the next timeout is a fresh loss window and
+                            // may cut ssthresh again. tcp_undo_cwnd_reduction
+                            // itself does NOT touch it, which is why only this
+                            // (RTO) path clears it.
+                            icsk_retransmits_ = 0;
                         }
                         rto_pending_ = false;
                         rto_retx_end_ = 0;
@@ -3307,6 +3355,9 @@ namespace xtcp {
                         if (0 != front.is_retrans) {
                             batch_retrans_ = true;
                         }
+                        // Unaccount BEFORE the pop destroys the element (front
+                        // is a reference into the deque).
+                        PipeAccountSeg(front, -1);
                         retrans_queue_.pop_front();
                         if (retrans_queue_.empty()) {
                             first_outstanding_ = 0;  // nothing outstanding: the user-timeout clock resets
@@ -3870,6 +3921,8 @@ namespace xtcp {
                         if (head.sacked < head.len && 0 == head.lost) {
                             head.lost = 1;
                             lost_out_pkts_ += head.pkt_count;
+                            // LOST takes the segment out of the pipe.
+                            PipeReaccountSeg(head, head.sacked, 0, head.retries);
                         }
                     }
                     CutCwnd();
@@ -3983,6 +4036,41 @@ namespace xtcp {
             }
         }
 
+        void TcpConn::PipeAccountSeg(const SentSeg& seg, int sign) noexcept {
+            PipeAccountFields(seg.len, seg.sacked, seg.lost, seg.retries, sign);
+        }
+
+        void TcpConn::PipeAccountFields(UInt32 len, UInt32 sacked, Byte lost,
+                                        UInt32 retries, int sign) noexcept {
+            // One segment's contribution to the three terms PipeInFlightBytes
+            // used to recompute by walking the whole queue. Takes plain values
+            // so callers can describe a PREVIOUS state of the segment without
+            // copying it (SentSeg owns a BufRef and is not copyable).
+            const UInt32 unsacked = (sacked < len) ? (len - sacked) : 0;
+            const UInt32 lost_bytes = (0 != lost) ? unsacked : 0;
+            const UInt32 retrans_bytes = (0 < retries) ? unsacked : 0;
+            if (sign > 0) {
+                pipe_sacked_bytes_ += sacked;
+                pipe_lost_bytes_ += lost_bytes;
+                pipe_retrans_bytes_ += retrans_bytes;
+            } else {
+                pipe_sacked_bytes_ = (pipe_sacked_bytes_ >= sacked)
+                    ? pipe_sacked_bytes_ - sacked : 0;
+                pipe_lost_bytes_ = (pipe_lost_bytes_ >= lost_bytes)
+                    ? pipe_lost_bytes_ - lost_bytes : 0;
+                pipe_retrans_bytes_ = (pipe_retrans_bytes_ >= retrans_bytes)
+                    ? pipe_retrans_bytes_ - retrans_bytes : 0;
+            }
+        }
+
+        void TcpConn::PipeReaccountSeg(const SentSeg& seg, UInt32 old_sacked,
+                                       Byte old_lost, UInt32 old_retries) noexcept {
+            // Remove the old contribution, add the new one. Only the three
+            // mutable fields participate, so this stays O(1).
+            PipeAccountFields(seg.len, old_sacked, old_lost, old_retries, -1);
+            PipeAccountFields(seg.len, seg.sacked, seg.lost, seg.retries, +1);
+        }
+
         UInt32 TcpConn::PipeInFlightBytes() const noexcept {
             // Kernel tcp_packets_in_flight():
             //   packets_out - tcp_left_out(tp) + retrans_out
@@ -3990,34 +4078,20 @@ namespace xtcp {
             // SACKed bytes sit in the receiver's buffer and LOST bytes have
             // been declared gone from the network - neither occupies the
             // pipe, so both are subtracted. Retransmitted bytes are back in
-            // flight (retrans_out) and are added again. Subtracting only
-            // sacked (the earlier bug) left "lost but not yet retransmitted"
-            // bytes in the pipe, so a fully-lost flight never looked empty
-            // and CA_EVENT_TX_START was suppressed on the retransmit that
-            // restarted the pipe.
-            UInt32 sacked = 0;
-            UInt32 lost = 0;
-            UInt32 retrans = 0;
-            for (const SentSeg& seg : retrans_queue_) {
-                sacked += seg.sacked;
-                if (0 != seg.lost && seg.sacked < seg.len) {
-                    lost += seg.len - seg.sacked;
-                }
-                if (0 < seg.retries) {
-                    retrans += seg.len - seg.sacked;
-                }
-            }
+            // flight (retrans_out) and are added again.
+            //
+            // O(1): the three sums are maintained incrementally at every
+            // queue/segment mutation (PipeAccountSeg / PipeReaccountSeg). The
+            // kernel derives the same value from its O(1) counters; walking the
+            // queue here cost ~850 iterations per ACK at a 100 Gbps BDP.
             const UInt32 inflight = snd_nxt_ - snd_una_;
-            // Saturating subtraction: sacked/lost are per-segment byte sums
-            // that can exceed the raw distance in the presence of a
-            // retransmitted tail, so clamp at 0 instead of wrapping.
-            const UInt32 left_out = sacked + lost;
+            const UInt32 left_out = pipe_sacked_bytes_ + pipe_lost_bytes_;
             const UInt32 base = (inflight > left_out) ? (inflight - left_out) : 0;
-            return base + retrans;
+            return base + pipe_retrans_bytes_;
         }
 
         UInt32 TcpConn::PipeBytes() const noexcept {
-            // RFC 6675 闂?: pipe = (HighData - HighACK) - SACKed + Retransmitted.
+            // RFC 6675 间: pipe = (HighData - HighACK) - SACKed + Retransmitted.
             // SACKed bytes sit in the receiver's buffer (not the network) and
             // retransmitted-but-unacked bytes occupy the pipe twice, so the
             // pipe is the true in-network occupancy - the cwnd (inflated to
@@ -4221,6 +4295,8 @@ namespace xtcp {
             // then retransmits ACKed data and the stream stalls (test_tso_tx
             // WSL regression). With the push first, a reentrant ACK sees the
             // complete queue and drains the segment normally.
+            // Account BEFORE the move: push_back moves `seg` out.
+            PipeAccountSeg(seg, +1);
             retrans_queue_.push_back(std::move(seg));
             if (1 == retrans_queue_.size()) {
                 ArmRetransmit(now);
@@ -4353,6 +4429,8 @@ namespace xtcp {
                             if (sink_) {
                                 sink_(seg.data.Clone());
                             }
+                            // Account BEFORE the move (see the SendData path).
+                            PipeAccountSeg(seg, +1);
                             retrans_queue_.push_back(std::move(seg));
                             if (1 == retrans_queue_.size()) {
                                 ArmRetransmit(now);
@@ -4752,6 +4830,8 @@ namespace xtcp {
                 // fix) - a synchronous backend delivers the peer's ACK
                 // reentrantly inside sink_(), and a queue missing this
                 // segment would advance snd_una_ past it, never reaping it.
+                // Account BEFORE the move (see the SendData path).
+                PipeAccountSeg(seg, +1);
                 retrans_queue_.push_back(std::move(seg));
                 if (1 == retrans_queue_.size()) {
                     ArmRetransmit(now);
@@ -4995,6 +5075,11 @@ namespace xtcp {
             last_ack_delayed_ = false;
             pending_send_ = ckpt.pending_send;
             retrans_queue_.clear();
+            // The queue is rebuilt from the checkpoint below; the pipe sums are
+            // re-accumulated per restored segment.
+            pipe_sacked_bytes_ = 0;
+            pipe_lost_bytes_ = 0;
+            pipe_retrans_bytes_ = 0;
             for (const SentSeg& s : ckpt.retrans_queue) {
                 SentSeg c;
                 c.seq = s.seq;
@@ -5035,6 +5120,9 @@ namespace xtcp {
                 if (0 != c.lost) {
                     lost_out_pkts_ += c.pkt_count;
                 }
+                // Account BEFORE the move: the pipe sums are rebuilt from the
+                // restored tags (the checkpoint starts a new epoch).
+                PipeAccountSeg(c, +1);
                 retrans_queue_.push_back(std::move(c));
             }
             if (0 < retrans_queue_.size()) {
@@ -5071,7 +5159,7 @@ namespace xtcp {
         }
 
         void TcpConn::SendChallengeAck() noexcept {
-            // RFC 5961 闂? / Linux tcp_challenge_ack_limit: a spoofed flood of
+            // RFC 5961 间 / Linux tcp_challenge_ack_limit: a spoofed flood of
             // out-of-window RSTs must NOT reflect 1:1 into challenge ACKs.
             // Allow up to kChallengeAckLimit per 1s window; excess challenges
             // are dropped silently (the connection is simply not closed).
@@ -5603,6 +5691,8 @@ namespace xtcp {
                                     // __tcp_transmit_skb, before retrans_out is
                                     // incremented: snapshot the gate first.
                                     const bool pipe_empty = (0 == PipeInFlightBytes());
+                                    // Account BEFORE the move: push_front moves `seg`.
+                                    PipeAccountSeg(seg, +1);
                                     retrans_queue_.push_front(std::move(seg));
                                     NotifyTxStart(pipe_empty);
                                     // Kernel TCPCB_SACKED_RETRANS accounting:
@@ -5628,6 +5718,8 @@ namespace xtcp {
                                     total_retrans_pkts_ +=
                                         retrans_queue_.front().pkt_count;
                                 } else {
+                                    // Account BEFORE the move (see above).
+                                    PipeAccountSeg(seg, +1);
                                     retrans_queue_.push_front(std::move(seg));
                                 }
                                 ArmRetransmit(now);

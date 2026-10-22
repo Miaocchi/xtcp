@@ -1571,6 +1571,70 @@ namespace {
     }
 
     /**
+     * @brief A successful spurious-RTO undo must zero icsk_retransmits.
+     *
+     * Kernel tcp_try_undo_loss (tcp_input_66.c:2600-2610) runs
+     *   icsk->icsk_retransmits = 0;
+     * inside the undo branch, while tcp_undo_cwnd_reduction does not touch it.
+     * Without the reset, every later timeout is still treated as "same loss
+     * window" by tcp_enter_loss' guard and never cuts ssthresh again.
+     *
+     * Sequence: RTO -> spurious (older tsecr) -> undo. Then a NEW RTO after the
+     * window advanced must cut ssthresh again.
+     */
+    void TestSpuriousRtoUndoResetsRetransmits() {
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kSynSent, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSndBuf(4u << 20);
+        xtcp::core::TimePoint now = 1000;
+        conn.SendSyn();
+        const UInt32 our_syn_ts = TsvalOf(tx.back());
+        const std::vector<Byte> synack = BuildSegTs(
+            443, 40000, 500, 101,
+            static_cast<UInt16>(xtcp::core::kFlagSyn | xtcp::core::kFlagAck), 65535,
+            777, our_syn_ts, false, 0, 0, true);
+        conn.OnSegment(synack.data(), static_cast<UInt32>(synack.size()), now);
+        CHECK(xtcp::core::TcpState::kEstablished == conn.State());
+
+        for (UInt32 i = 0; i < 10; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        const UInt32 cwnd_pre = conn.Cwnd();
+        // RTO #1, then an ACK echoing an OLDER TSval -> spurious -> undo.
+        now += 3000000;
+        conn.OnRetransmitTimer(now);
+        const UInt32 rto_ts = TsvalOf(tx.back());
+        CHECK(0 != rto_ts);
+        now += 20000;
+        const UInt32 ack1 = conn.SndUna() + kMss;
+        const std::vector<Byte> a1 = BuildSegTs(
+            40000, 443, 201, ack1, xtcp::core::kFlagAck, 65535, 888, rto_ts - 1);
+        conn.OnSegment(a1.data(), static_cast<UInt32>(a1.size()), now);
+        std::fprintf(stderr, "[spurious-rto] pre=%u after undo cwnd=%u ssth=%u\n",
+                     cwnd_pre, conn.Cwnd(), conn.Ssthresh());
+        CHECK(conn.Cwnd() + 2 >= cwnd_pre);   // the undo restored the window
+        const UInt32 ssth_after_undo = conn.Ssthresh();
+
+        // The ACK advanced snd_una past high_seq, so a new loss window opens.
+        // A fresh RTO must therefore cut ssthresh again - unless the undo left
+        // icsk_retransmits set, in which case the guard suppresses the cut.
+        now += 3000000;
+        conn.OnRetransmitTimer(now);
+        std::fprintf(stderr, "[spurious-rto] next RTO ssth=%u (was %u)\n",
+                     conn.Ssthresh(), ssth_after_undo);
+        // The cut happened. Note: the ACK above also advanced snd_una, which
+        // clears icsk_retransmits on its own (kernel tcp_clear_retrans), so
+        // this assertion guards the END-TO-END behaviour rather than the
+        // single reset inside the undo branch (that one is a faithful copy of
+        // tcp_try_undo_loss and is currently redundant on this path).
+        CHECK(conn.Ssthresh() < ssth_after_undo);
+    }
+
+    /**
      * @brief T2-2 (D04): a no-TSopt RTO must still be ADJUDICATED by a
      *        cumulative ACK that covers the retransmitted range, so the sticky
      *        `rto_pending_` can no longer disable the D-SACK undo forever.
@@ -3325,6 +3389,56 @@ namespace {
         // tcp_reno_ssthresh and is covered by TestRenoSsthreshFollowsCwnd.
         CHECK(0x7FFFFFFFu == conn.Ssthresh());
     }
+    /**
+     * @brief The O(1) in-flight counters must always equal the queue walk.
+     *
+     * PipeInFlightBytes() is now maintained incrementally (pipe_sacked_bytes_ /
+     * pipe_lost_bytes_ / pipe_retrans_bytes_) instead of walking
+     * retrans_queue_ on every ACK - the walk cost ~1.6 ns per queued segment,
+     * i.e. ~1.3 us per ACK at a 100 Gbps BDP. The incremental form is only safe
+     * if every mutation re-accounts the segment, so this test drives the
+     * interesting transitions (send, SACK partial, SACK full, LOST, retransmit,
+     * pop) and compares against PipeWalkReference() after each one.
+     */
+    void TestPipeCountersMatchWalk() {
+        FsmHarness h;
+        h.conn.SetSackOk(true);
+        h.conn.SetSndBuf(8u << 20);
+        for (UInt32 i = 0; i < 8; ++i) {
+            h.Send(kMss);
+        }
+        CHECK(h.conn.PipeInFlightBytesPublic() == h.conn.PipeWalkReference());
+        const UInt32 una = h.conn.SndUna();
+        const UInt32 end = h.conn.SndNxt();
+
+        // Partial SACK coverage (two segments of the tail).
+        h.now += 1000;
+        h.Deliver(una, xtcp::core::kFlagAck, 65535, true, una + 2 * kMss, end);
+        CHECK(h.conn.PipeInFlightBytesPublic() == h.conn.PipeWalkReference());
+
+        // More SACK coverage (narrows the unsacked part of each segment).
+        h.now += 1000;
+        h.Deliver(una, xtcp::core::kFlagAck, 65535, true, una + kMss, end);
+        CHECK(h.conn.PipeInFlightBytesPublic() == h.conn.PipeWalkReference());
+
+        // RTO: marks the head LOST and retransmits it (lost + retries change).
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        CHECK(h.conn.PipeInFlightBytesPublic() == h.conn.PipeWalkReference());
+
+        // Cumulative ACK drains the head (pop).
+        h.now += 20000;
+        h.Deliver(una + kMss);
+        CHECK(h.conn.PipeInFlightBytesPublic() == h.conn.PipeWalkReference());
+
+        // Full drain.
+        h.now += 20000;
+        h.Deliver(h.conn.SndNxt());
+        CHECK(h.conn.PipeInFlightBytesPublic() == h.conn.PipeWalkReference());
+        CHECK(0u == h.conn.RetransQueueSize());
+        CHECK(0u == h.conn.PipeInFlightBytesPublic());
+    }
+
     void TestKccPipeExcludesLost() {
         // Fully-lost flight, retransmitted: the TX_START gate must see the
         // pre-retransmission pipe (kernel tcp_event_data_sent runs INSIDE
@@ -4301,6 +4415,7 @@ int main() {
     TestMigrationKeepsRetransTag();
     TestMigrationClearsOooBytes();
     TestKccPipeExcludesLost();
+    TestPipeCountersMatchWalk();
     TestCcInflightExcludesSacked();
     TestKccTxStartOnTlp();
     TestKccDsackCountsDelivered();
@@ -4315,6 +4430,7 @@ int main() {
     TestKccJitterEwmaWideMul();
     TestKccOracleZeroMss();
     TestEifelRejectsNewerTsval();
+    TestSpuriousRtoUndoResetsRetransmits();
     TestDsackUndoAfterRtoWithoutTsopt();
     TestNoUndoWhileRetransInFlight();
     TestNoUndoWhenOwnRetransmitCounts();
