@@ -3511,7 +3511,10 @@ namespace xtcp {
                 } else {
                     // No plugin (Reno default): clear the loss accumulator so
                     // it cannot grow unbounded (there is no hook to report it).
+                    // The packet-domain twin must be cleared with it, or it
+                    // keeps accumulating forever on a Reno flow.
                     cc_.lost = 0;
+                    cc_.lost_pkts = 0;
                     if (cc_.snd_cwnd < cc_.snd_ssthresh) {
                         // Slow start: one segment per segment acknowledged,
                         // clamped so snd_cwnd never overshoots ssthresh - an
@@ -4812,6 +4815,11 @@ namespace xtcp {
                 c.sacked = s.sacked;
                 c.pkt_count = s.pkt_count;
                 c.lost = s.lost;
+                // See ApplyCheckpoint: the retransmit marker and the
+                // retirement flag must survive, but the absolute delivery
+                // watermark must not (the restore starts a new epoch).
+                c.is_retrans = s.is_retrans;
+                c.retrans_out_retired = s.retrans_out_retired;
                 c.data = const_cast<buf::BufRef&>(s.data).Clone();
                 ckpt.retrans_queue.push_back(std::move(c));
             }
@@ -4845,6 +4853,13 @@ namespace xtcp {
             cc_.delivered_mstamp = 0;
             cc_.app_limited = 0;
             cc_.lost = 0;
+            // Packet-domain twin of cc_.lost (kernel tp->lost): it is a
+            // per-sample accumulator consumed by EmitRateSample, so a migrated
+            // flow must not inherit the source's freshly-marked-loss count
+            // (that would subtract phantom segments from the new flow's cwnd
+            // on its first ACK). max_pacing_rate is deliberately NOT reset:
+            // it is a user policy (SO_MAX_PACING_RATE), not connection state.
+            cc_.lost_pkts = 0;
             last_rate_sample_ = 0;
             last_delivered_ = 0;
             last_delivered_pkts_ = 0;
@@ -4925,7 +4940,36 @@ namespace xtcp {
                 c.sacked = s.sacked;
                 c.pkt_count = s.pkt_count;
                 c.lost = s.lost;
+                // TCPCB_RETRANS and the retirement flag travel with the
+                // segment: without is_retrans a migrated retransmit looks like
+                // a first transmission, so popping it would neither decrement
+                // retrans_out_pkts_ (permanently inflating the pipe) nor set
+                // batch_retrans_ for the delayed-ACK heuristic.
+                c.is_retrans = s.is_retrans;
+                c.retrans_out_retired = s.retrans_out_retired;
+                // The send-time delivery snapshots must NOT be carried: this
+                // migration starts a NEW delivered epoch (cc_.delivered and
+                // cc_.delivered_pkts above are reset to 0), so the source's
+                // absolute watermark would be larger than the new epoch's
+                // total. That poisons batch_prior_delivered_pkts_ (see the
+                // popped_count block), making rs.prior_delivered_pkts exceed
+                // rs.delivered_total_pkts and firing a spurious KCC round
+                // boundary on the first ACK. They stay 0, like a segment that
+                // has not been (re)transmitted in this epoch yet.
+                c.app_limited = 0;
                 c.data = const_cast<buf::BufRef&>(s.data).Clone();
+                // Kernel tp->retrans_out / tp->lost_out are AGGREGATES over
+                // the skb tags, not independent counters. The restore zeroed
+                // both above (the checkpoint carries no connection history),
+                // so they must be rebuilt from the tags that just arrived -
+                // otherwise the queue and the counters disagree and a popped
+                // retransmit would underflow the aggregate.
+                if (0 != c.is_retrans && 0 == c.retrans_out_retired) {
+                    retrans_out_pkts_ += c.pkt_count;
+                }
+                if (0 != c.lost) {
+                    lost_out_pkts_ += c.pkt_count;
+                }
                 retrans_queue_.push_back(std::move(c));
             }
             if (0 < retrans_queue_.size()) {

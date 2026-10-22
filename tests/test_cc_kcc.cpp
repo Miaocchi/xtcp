@@ -3090,6 +3090,59 @@ namespace {
     }
 
     /**
+     * @brief Migration must carry TCPCB_RETRANS with the segment.
+     *
+     * Kernel tcp_clean_rtx_queue decrements retrans_out only for an skb still
+     * tagged TCPCB_SACKED_RETRANS (tcp_input_66.c:3300-3310), and the
+     * FLAG_RETRANS_DATA_ACKED bit feeds the delayed-ACK heuristic. A
+     * checkpoint that drops is_retrans makes a migrated retransmit look like a
+     * first transmission: popping it leaves retrans_out_pkts_ inflated forever
+     * (the pipe never empties) and suppresses batch_retrans_.
+     *
+     * Red baseline: after the migration and a full cumulative ACK,
+     * RetransOutPkts() stays 1 instead of returning to 0.
+     */
+    void TestMigrationKeepsRetransTag() {
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn src(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        src.SetPeerMss(kMss);
+        src.SetSndBuf(4u << 20);
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 4; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(src.SendData(buf.data(), kMss, now));
+        }
+        // RTO retransmits the head, tagging it TCPCB_RETRANS.
+        now += 3000000;
+        src.OnRetransmitTimer(now);
+        CHECK(1u == src.RetransOutPkts());
+        const xtcp::core::TcpConn::ConnCheckpoint ck = src.MakeCheckpoint();
+        CHECK(4 == ck.retrans_queue.size());
+        // The head was the RTO retransmit: it carries the TCPCB_RETRANS tag.
+        CHECK(1u == ck.retrans_queue.front().is_retrans);
+
+        std::vector<xtcp::buf::BufRef> tx2;
+        xtcp::core::TcpConn dst(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 500, 900,
+            [&tx2](xtcp::buf::BufRef&& p) { tx2.push_back(std::move(p)); });
+        dst.SetPeerMss(kMss);
+        dst.SetSndBuf(4u << 20);
+        dst.ApplyCheckpoint(ck);
+        CHECK(4 == dst.RetransQueueSize());  // segments restored
+        CHECK(1u == dst.RetransOutPkts());   // the tag survived
+
+        // Cumulative ACK for everything: the retransmit is retired, so the
+        // in-flight retransmission counter must drain to 0.
+        now += 20000;
+        DeliverRawAck(dst, now, dst.SndNxt());
+        std::fprintf(stderr, "[mig-retrans] after full ACK retrans_out=%u\n",
+                     dst.RetransOutPkts());
+        CHECK(0u == dst.RetransOutPkts());   // red: stays 1 without is_retrans
+    }
+
+    /**
      * @brief PipeInFlightBytes must subtract LOST bytes too.
      *
      * Kernel tcp_packets_in_flight() = packets_out - (sacked_out + lost_out)
@@ -4112,6 +4165,7 @@ int main() {
     TestRackDoesNotRecutInCwr();
     TestRackKeepsRtoSnapshot();
     TestMigrationResetsKccRecoveryState();
+    TestMigrationKeepsRetransTag();
     TestKccPipeExcludesLost();
     TestCcInflightExcludesSacked();
     TestKccTxStartOnTlp();
