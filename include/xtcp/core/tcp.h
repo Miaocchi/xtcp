@@ -1306,6 +1306,16 @@ namespace xtcp {
 
             bool        rto_pending_ = false;    /**< RFC 3522 Eifel: an RTO retransmission awaits its ACK */
             /**
+             * @brief Kernel icsk_retransmits: consecutive RTO firings on the
+             *        SAME recovery window. tcp_enter_loss only recomputes
+             *        ssthresh/prior_* when this is 0 (tcp_input_66.c:2165-2173
+             *        `state == TCP_CA_Loss && !icsk_retransmits`), so a second
+             *        timeout inside one window must not halve the threshold
+             *        again. Cleared whenever an ACK clears retransmission
+             *        state (kernel tcp_clear_retrans).
+             */
+            UInt32      icsk_retransmits_ = 0;
+            /**
              * @brief Kernel tp->retrans_stamp: the TSval of the FIRST
              *        retransmission of the current episode. Successive
              *        retransmissions must NOT advance it (kernel comment

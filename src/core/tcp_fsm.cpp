@@ -1852,7 +1852,31 @@ namespace xtcp {
                 }
                 break;          // only the retransmission head is marked
             }
-            CutCwnd();
+            // Kernel tcp_enter_loss guard (tcp_input_66.c:2165-2173): the
+            // reduction (ssthresh/prior_ssthresh/prior_cwnd) is recomputed
+            // only when
+            //   state <= Disorder  ||  !after(high_seq, snd_una)  ||
+            //   (state == Loss && !icsk_retransmits)
+            // A second timeout inside the SAME window therefore keeps the
+            // first cut instead of halving it again - and, crucially, keeps
+            // the FIRST prior_ssthresh/prior_cwnd snapshot (a repeated cut
+            // would overwrite the undo target with an already-halved value).
+            // cwnd = packets_in_flight + 1 is applied unconditionally by
+            // tcp_enter_loss, so the window still collapses.
+            const bool reduce_this_loss =
+                (4 != cc_.ca_state) ||
+                !SeqLt(snd_una_, high_seq_) ||
+                (0 == icsk_retransmits_);
+            if (reduce_this_loss) {
+                CutCwnd();
+            } else {
+                // Same-window retransmission: only the window collapses.
+                const UInt32 pipe_pkts =
+                    (PipeInFlightBytes() + peer_mss_ - 1) / peer_mss_;
+                cc_.snd_cwnd = (0 < pipe_pkts) ? pipe_pkts + 1 : 1;
+                cc_.snd_cwnd_cnt = 0;
+            }
+            ++icsk_retransmits_;
             SetCaState(4);   // kernel tcp_enter_loss: tcp_set_ca_state(CA_Loss)
             // Kernel tcp_enter_loss: tp->high_seq = tp->snd_nxt (the recovery
             // -end test is snd_una >= high_seq).
@@ -3321,6 +3345,11 @@ namespace xtcp {
                 fast_retransmit_seq_ = 0;
                 last_retx_seq_ = 0;  // storm gate: a fresh cumulative ACK resets the context
                 last_retx_len_ = 0;
+                // Kernel tcp_clear_retrans (tcp_input_66.c:3829) zeroes
+                // icsk_retransmits once a cumulative ACK acknowledges data:
+                // the next timeout starts a NEW loss window, so it may cut
+                // ssthresh again.
+                icsk_retransmits_ = 0;
                 // RFC 8985 TLP: any cumulative ACK cancels the pending probe.
                 tlp_armed_ = false;
                 tlp_deadline_ = 0;
@@ -4929,6 +4958,7 @@ namespace xtcp {
             rto_ts_val_ = 0;
             retrans_stamp_ts_ = 0;
             rto_retx_end_ = 0;
+            icsk_retransmits_ = 0;   // kernel icsk_retransmits: new epoch
             cc_.ca_state = 0;
             cc_.prior_cwnd = 0;
             cc_.prior_ssthresh = 0;

@@ -2767,6 +2767,56 @@ namespace {
      * Red baseline: the RACK verdict cuts the window a second time
      * (cwnd 1 -> 2, ssthresh unchanged) and sets fast_recovery_.
      */
+    /**
+     * @brief Kernel tcp_enter_loss must not re-cut ssthresh for a repeated
+     *        timeout inside the SAME loss window.
+     *
+     * tcp_input_66.c:2165-2173 guards the reduction with
+     *   state <= Disorder || !after(high_seq, snd_una) ||
+     *   (state == Loss && !icsk_retransmits)
+     * so a second RTO while snd_una is still below high_seq and a
+     * retransmission is already outstanding keeps the FIRST cut - and the
+     * first prior_ssthresh/prior_cwnd snapshot, which the spurious-RTO undo
+     * later restores. cwnd = packets_in_flight + 1 still applies.
+     *
+     * Red baseline: ssthresh goes 5 -> 2 -> 2 across three back-to-back RTOs
+     * and prior_cwnd_ is overwritten with an already-cut window.
+     */
+    void TestRepeatedRtoKeepsFirstCut() {
+        FsmHarness h;
+        h.conn.SetSndBuf(4u << 20);
+        for (UInt32 i = 0; i < 10; ++i) {
+            h.Send(kMss);
+        }
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        const UInt32 ssth_first = h.conn.Ssthresh();
+        const UInt32 cwnd_first = h.conn.Cwnd();
+        CHECK(5u == ssth_first);   // max(cwnd 10 >> 1, 2)
+        CHECK(1u == cwnd_first);   // pipe empty (head LOST) + 1
+
+        // Two more timeouts inside the same window (snd_una < high_seq).
+        for (UInt32 r = 0; r < 2; ++r) {
+            h.now += 3000000;
+            h.conn.OnRetransmitTimer(h.now);
+            std::fprintf(stderr, "[repeated-rto] r=%u cwnd=%u ssth=%u\n",
+                         r + 1, h.conn.Cwnd(), h.conn.Ssthresh());
+            CHECK(ssth_first == h.conn.Ssthresh());   // red: halved to 2
+            CHECK(1u == h.conn.Cwnd());
+        }
+
+        // A cumulative ACK that advances snd_una opens a NEW window, so the
+        // next timeout cuts again (kernel tcp_clear_retrans zeroes
+        // icsk_retransmits).
+        h.now += 20000;
+        h.Deliver(h.conn.SndUna() + kMss);
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        std::fprintf(stderr, "[repeated-rto] new window ssth=%u\n", h.conn.Ssthresh());
+        CHECK(ssth_first != h.conn.Ssthresh());       // a fresh cut happened
+        CHECK(2u == h.conn.Ssthresh());               // max(cwnd 2 >> 1, 2)
+    }
+
     void TestRackDoesNotReenterLoss() {
         FsmHarness h;
         h.conn.SetSackOk(true);
@@ -4243,6 +4293,7 @@ int main() {
     TestLossExitHasNoCompleteCwr();
     TestApplyCheckpointResetsCongestionView();
     TestApplyCheckpointFullReset();
+    TestRepeatedRtoKeepsFirstCut();
     TestRackDoesNotReenterLoss();
     TestRackDoesNotRecutInCwr();
     TestRackKeepsRtoSnapshot();
