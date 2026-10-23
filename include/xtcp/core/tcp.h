@@ -622,7 +622,7 @@ namespace xtcp {
                     if (0 != seg.lost && seg.sacked < seg.len) {
                         lost += seg.len - seg.sacked;
                     }
-                    if (0 < seg.retries) {
+                    if (0 != seg.is_retrans) {
                         retrans += seg.len - seg.sacked;
                     }
                 }
@@ -1082,18 +1082,19 @@ namespace xtcp {
             /**
              * @brief Same as PipeAccountSeg but from plain values, so a caller
              *        can describe a segment's PREVIOUS state without copying it
-             *        (SentSeg owns a BufRef and is not copyable).
+             *        (SentSeg owns a BufRef and is not copyable). The retransmit
+             *        term is keyed on `is_retrans` (kernel TCPCB_SACKED_RETRANS).
              */
             void PipeAccountFields(UInt32 len, UInt32 sacked, Byte lost,
-                                   UInt32 retries, int sign) noexcept;
+                                   Byte is_retrans, int sign) noexcept;
             /**
              * @brief Re-derives one segment's pipe terms after a field of that
-             *        segment changed (seg.sacked / seg.lost / seg.retries).
-             *        `old_sacked`/`old_lost`/`old_retries` are the values BEFORE
-             *        the mutation.
+             *        segment changed (seg.sacked / seg.lost / seg.is_retrans).
+             *        `old_sacked`/`old_lost`/`old_is_retrans` are the values
+             *        BEFORE the mutation.
              */
             void PipeReaccountSeg(const SentSeg& seg, UInt32 old_sacked,
-                                  Byte old_lost, UInt32 old_retries) noexcept;
+                                  Byte old_lost, Byte old_is_retrans) noexcept;
             /**
              * @brief Kernel interval_to_edt in MICROSECONDS: how long until
              *        the pacing queue drains (tp->tcp_wstamp_ns equivalent,

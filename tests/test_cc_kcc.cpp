@@ -3734,6 +3734,13 @@ namespace {
                      static_cast<UInt16>(xtcp::core::kFlagSyn | xtcp::core::kFlagAck));
         h.conn.OnSegment(synack.data(), static_cast<UInt32>(synack.size()), h.now);
         CHECK(xtcp::core::TcpState::kEstablished == h.conn.State());
+        // The requeued early data carries TCPCB_SACKED_RETRANS, so it counts in
+        // retrans_out and therefore in the pipe. The O(1) sum must agree with
+        // the walk (the segment has is_retrans set but retries == 0 - the pipe
+        // term is keyed on the FORMER, like the kernel's retrans_out).
+        CHECK(h.conn.PipeInFlightBytesPublic() == h.conn.PipeWalkReference());
+        CHECK(0 < h.conn.RetransOutPkts());
+        CHECK(h.conn.PipeInFlightBytesPublic() >= 100u);
 
         h.now = 40000;
         h.Deliver(201);

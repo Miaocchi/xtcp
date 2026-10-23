@@ -1353,11 +1353,10 @@ namespace xtcp {
                 // owns that state, and the window-ACK path clears the queue).
                 if (TcpState::kFinWait1 == state_ || TcpState::kLastAck == state_ ||
                     TcpState::kClosing == state_) {
-                    // retries 0 -> 1 makes the segment count as retransmitted in
-                    // the pipe sums, so re-account it.
-                    const UInt32 old_retries = seg.retries;
+                    // A skipped transmit: consume the retry budget but do NOT
+                    // set is_retrans (no bytes left the wire), so the pipe
+                    // contribution is unchanged.
                     ++seg.retries;
-                    PipeReaccountSeg(seg, seg.sacked, seg.lost, old_retries);
                 }
                 rto_deadline_ = now + ((0 == seg.rto) ? rto_ : seg.rto);
                 timers_dirty_.store(true, std::memory_order_relaxed);
@@ -1445,12 +1444,8 @@ namespace xtcp {
                 // exhaustion -> empty copy) must NOT consume kMaxDataRetries:
                 // the connection and the network are healthy, the peer's
                 // window merely shrank below the queued segment length.
-                {
-                    const UInt32 old_retries = seg.retries;
-                    ++seg.retries;
-                    // retries 0 -> 1 flips the pipe term for this segment.
-                    PipeReaccountSeg(seg, seg.sacked, seg.lost, old_retries);
-                }
+                const Byte old_is_retrans = seg.is_retrans;
+                ++seg.retries;
                 ++retransmit_count_;
                 // Kernel tcp_rate_skb_sent refreshes tx.delivered on every
                 // (re)transmission; TCPCB_RETRANS marks the skb so the ACK
@@ -1465,6 +1460,9 @@ namespace xtcp {
                 total_retrans_pkts_ += seg.pkt_count;
                 seg.app_limited = (0 != cc_.app_limited) ? 1 : 0;
                 seg.is_retrans = 1;
+                // TCPCB_SACKED_RETRANS is now set: the segment counts in
+                // retrans_out, so refresh its pipe contribution (0 -> 1).
+                PipeReaccountSeg(seg, seg.sacked, seg.lost, old_is_retrans);
                 seg.rto = (0 == seg.rto) ? rto_ : seg.rto;
                 if (seg.rto < kMaxRto) {
                     seg.rto *= 2;  // exponential backoff
@@ -1877,7 +1875,7 @@ namespace xtcp {
                     s.lost = 1;
                     lost_out_pkts_ += s.pkt_count;
                     // LOST takes the segment out of the pipe: re-account it.
-                    PipeReaccountSeg(s, s.sacked, 0, s.retries);
+                    PipeReaccountSeg(s, s.sacked, 0, s.is_retrans);
                 }
                 break;          // only the retransmission head is marked
             }
@@ -2655,12 +2653,8 @@ namespace xtcp {
                             // reference. Everything touching `seg` must therefore
                             // complete first; sink_ only needs the moved `copy`.
                             ++retransmit_count_;
-                            {
-                                const UInt32 old_retries = seg.retries;
-                                ++seg.retries;
-                                // retries 0 -> 1 flips the pipe term.
-                                PipeReaccountSeg(seg, seg.sacked, seg.lost, old_retries);
-                            }
+                            const Byte old_is_retrans = seg.is_retrans;
+                            ++seg.retries;
                             // Loss signal: mark the segment's bytes lost on its
                             // FIRST retransmit only (kernel semantics: "lost" =
                             // newly marked lost since the last ACK). Repeated
@@ -2680,6 +2674,9 @@ namespace xtcp {
                             seg.pkt_count = PktCount(seg.len, peer_mss_);
                             seg.app_limited = (0 != cc_.app_limited) ? 1 : 0;
                             seg.is_retrans = 1;
+                            // TCPCB_SACKED_RETRANS is now set (0 -> 1 on the
+                            // first retransmit): refresh the pipe term.
+                            PipeReaccountSeg(seg, seg.sacked, seg.lost, old_is_retrans);
                             sack_retx_next_ = missing + tx_len;  // next byte of the same gap
                             last_retx_seq_ = missing;  // storm gate: remember the emitted range
                             last_retx_len_ = tx_len;
@@ -2785,7 +2782,7 @@ namespace xtcp {
                         seg.lost = 1;
                         lost_out_pkts_ += seg.pkt_count;
                         // LOST takes the segment out of the pipe.
-                        PipeReaccountSeg(seg, seg.sacked, 0, seg.retries);
+                        PipeReaccountSeg(seg, seg.sacked, 0, seg.is_retrans);
                     }
                     break;
                 }
@@ -2937,7 +2934,7 @@ namespace xtcp {
                             if (0 < add) {
                                 const UInt32 before = seg.sacked;
                                 const Byte before_lost = seg.lost;
-                                const UInt32 before_retries = seg.retries;
+                                const Byte before_is_retrans = seg.is_retrans;
                                 seg.sacked += add;
                                 // Kernel tcp_sacktag_one counts a skb's pcount
                                 // ONCE, on its transition to TCPCB_SACKED_ACKED
@@ -2980,7 +2977,7 @@ namespace xtcp {
                                 }
                                 // seg.sacked (and possibly seg.lost) changed:
                                 // refresh the O(1) pipe sums for this segment.
-                                PipeReaccountSeg(seg, before, before_lost, before_retries);
+                                PipeReaccountSeg(seg, before, before_lost, before_is_retrans);
                             }
                         }
                     }
@@ -3933,7 +3930,7 @@ namespace xtcp {
                             head.lost = 1;
                             lost_out_pkts_ += head.pkt_count;
                             // LOST takes the segment out of the pipe.
-                            PipeReaccountSeg(head, head.sacked, 0, head.retries);
+                            PipeReaccountSeg(head, head.sacked, 0, head.is_retrans);
                         }
                     }
                     CutCwnd();
@@ -4048,18 +4045,24 @@ namespace xtcp {
         }
 
         void TcpConn::PipeAccountSeg(const SentSeg& seg, int sign) noexcept {
-            PipeAccountFields(seg.len, seg.sacked, seg.lost, seg.retries, sign);
+            PipeAccountFields(seg.len, seg.sacked, seg.lost, seg.is_retrans, sign);
         }
 
         void TcpConn::PipeAccountFields(UInt32 len, UInt32 sacked, Byte lost,
-                                        UInt32 retries, int sign) noexcept {
+                                        Byte is_retrans, int sign) noexcept {
             // One segment's contribution to the three terms PipeInFlightBytes
             // used to recompute by walking the whole queue. Takes plain values
             // so callers can describe a PREVIOUS state of the segment without
             // copying it (SentSeg owns a BufRef and is not copyable).
+            //
+            // The retransmission term is keyed on is_retrans (kernel
+            // TCPCB_SACKED_RETRANS), NOT on retries>0: the kernel's retrans_out
+            // is its own counter driven by that flag, and the TFO path marks
+            // early data as retransmitted without bumping `retries` (it was
+            // first sent in the SYN, so it is not a retry).
             const UInt32 unsacked = (sacked < len) ? (len - sacked) : 0;
             const UInt32 lost_bytes = (0 != lost) ? unsacked : 0;
-            const UInt32 retrans_bytes = (0 < retries) ? unsacked : 0;
+            const UInt32 retrans_bytes = (0 != is_retrans) ? unsacked : 0;
             if (sign > 0) {
                 pipe_sacked_bytes_ += sacked;
                 pipe_lost_bytes_ += lost_bytes;
@@ -4075,11 +4078,11 @@ namespace xtcp {
         }
 
         void TcpConn::PipeReaccountSeg(const SentSeg& seg, UInt32 old_sacked,
-                                       Byte old_lost, UInt32 old_retries) noexcept {
+                                       Byte old_lost, Byte old_is_retrans) noexcept {
             // Remove the old contribution, add the new one. Only the three
             // mutable fields participate, so this stays O(1).
-            PipeAccountFields(seg.len, old_sacked, old_lost, old_retries, -1);
-            PipeAccountFields(seg.len, seg.sacked, seg.lost, seg.retries, +1);
+            PipeAccountFields(seg.len, old_sacked, old_lost, old_is_retrans, -1);
+            PipeAccountFields(seg.len, seg.sacked, seg.lost, seg.is_retrans, +1);
         }
 
         UInt32 TcpConn::PipeInFlightBytes() const noexcept {
@@ -5707,6 +5710,9 @@ namespace xtcp {
                                     NotifyTxStart(pipe_empty);
                                     // Kernel TCPCB_SACKED_RETRANS accounting:
                                     // the requeued early data is retransmitted.
+                                    // The pipe sum already counted it: seg has
+                                    // is_retrans set BEFORE the push, so
+                                    // PipeAccountSeg(seg, +1) included it.
                                     retrans_out_pkts_ += retrans_queue_.front().pkt_count;
                                     // Kernel tcp_output_66.c:3390-3392: this
                                     // re-send is a real retransmission, so it
