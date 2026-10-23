@@ -2456,6 +2456,42 @@ namespace {
     }
 
     /**
+     * @brief Kernel tcp_process_loss (tcp_input_66.c:2845-2885) calls
+     *        tcp_try_undo_recovery (tcp_input_66.c:2551-2577) when snd_una
+     *        reaches high_seq in CA_Loss. tcp_try_undo_recovery holds the
+     *        state via tcp_is_non_sack_preventing_reopen (tcp_input_66.c:
+     *        2535-2548) for a no-SACK Reno connection at exactly high_seq -
+     *        reopening there lets the next dup-ACK start a false fast
+     *        retransmit (RFC 2582). The port's CA_Loss exit (tcp_fsm.cpp:
+     *        3766-3780) closed the episode unconditionally, so this pins it.
+     */
+    void TestNonSackLossHoldsAtHighSeq() {
+        FsmHarness h;
+        h.conn.SetSackOk(false);   // kernel tcp_is_reno(tp)
+        h.conn.SetSndBuf(4u << 20);
+        for (UInt32 i = 0; i < 4; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 end = h.conn.SndNxt();
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);   // RTO -> CA_Loss, high_seq = snd_nxt
+        g_recCalls = 0;
+        g_recCaState = 0xFF;
+        h.now += 20000;
+        h.Deliver(end);                    // ACK exactly at high_seq
+        CHECK(1 <= g_recCalls);
+        CHECK(4u == g_recCaState);         // held CA_Loss (red: 0 before the fix)
+        // The ACK above high_seq (new data sent after the held ACK) ends it.
+        h.Send(kMss);
+        g_recCalls = 0;
+        g_recCaState = 0xFF;
+        h.now += 20000;
+        h.Deliver(h.conn.SndNxt());
+        CHECK(1 <= g_recCalls);
+        CHECK(0u == g_recCaState);
+    }
+
+    /**
      * @brief A no-SACK partial ACK must retransmit the next hole.
      *
      * Kernel tcp_identify_packet_loss (tcp_input_66.c:2941-2956) dispatches
@@ -4839,6 +4875,7 @@ int main() {
     TestKccFsmCwndStaysLegal();
     TestKccFsmCaStateReturnsToOpen();
     TestNonSackRecoveryHoldsAtHighSeq();
+    TestNonSackLossHoldsAtHighSeq();
     TestNonSackPartialAckRetransmitsNextHole();
     TestKccRecoveryExitKeepsPriorCwnd();
     TestKccRecoveryExitKeepsCcWindow();

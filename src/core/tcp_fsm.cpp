@@ -3769,15 +3769,29 @@ namespace xtcp {
                         //   return;                              (tcp_input.c:2881-2885)
                         // i.e. NO tcp_end_cwnd_reduction: neither a
                         // `cwnd = ssthresh` collapse nor CA_EVENT_COMPLETE_CWR.
-                        fast_recovery_ = false;
-                        sack_retx_next_ = 0;
-                        undo_retrans_ = -1;
-                        SetCaState(0);
-                        high_seq_ = 0;
-                        // No RTO verdict can outlive its episode.
-                        rto_pending_ = false;
-                        rto_retx_end_ = 0;
-                        retrans_stamp_ts_ = 0;
+                        //
+                        // tcp_try_undo_recovery (tcp_input.c:2551-2577) then
+                        // calls tcp_is_non_sack_preventing_reopen
+                        // (tcp_input.c:2535-2548): a no-SACK Reno connection at
+                        // exactly high_seq HOLDS the state (RFC 2582 - reopening
+                        // there lets the next dup-ACK start a false fast
+                        // retransmit). The Recovery branch above already holds
+                        // (hold_reno); this Loss branch must do the same
+                        // (audit D19). Without it the RTO episode closed one
+                        // segment too early and the following dup-ACK re-entered
+                        // a spurious fast recovery.
+                        const bool hold_reno = (snd_una_ == high_seq_) && !sack_ok_;
+                        if (!hold_reno) {
+                            fast_recovery_ = false;
+                            sack_retx_next_ = 0;
+                            undo_retrans_ = -1;
+                            SetCaState(0);
+                            high_seq_ = 0;
+                            // No RTO verdict can outlive its episode.
+                            rto_pending_ = false;
+                            rto_retx_end_ = 0;
+                            retrans_stamp_ts_ = 0;
+                        }
                     } else {
                         // Already Open (or Disorder): the episode marker is
                         // stale - drop it without touching the window.
