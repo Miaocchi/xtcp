@@ -3390,6 +3390,75 @@ namespace {
         CHECK(0x7FFFFFFFu == conn.Ssthresh());
     }
     /**
+     * @brief A timeout marks EVERY un-SACKed segment lost, not just the head.
+     *
+     * Kernel tcp_timeout_mark_lost (tcp_input_66.c:2140-2148) walks the whole
+     * retransmit rbtree and calls tcp_mark_skb_lost on every skb that is not
+     * SACKED_ACKED:
+     *
+     *     skb = head;
+     *     skb_rbtree_walk_from(skb) {
+     *         if (is_reneg) ...
+     *         else if (tcp_is_rack(sk) && skb != head &&
+     *                  tcp_rack_skb_timeout(tp, skb, 0) > 0)
+     *             continue;  // Don't mark recently sent ones lost yet
+     *         tcp_mark_skb_lost(sk, skb);
+     *     }
+     *
+     * tcp_mark_skb_lost then does tp->lost_out += tcp_skb_pcount(skb) for
+     * every one of them (:1121). Only AFTER that does tcp_enter_loss compute
+     * tcp_snd_cwnd_set(tp, tcp_packets_in_flight(tp) + 1) (:2174) - with
+     * lost_out covering the whole flight, so the post-timeout window is 1.
+     *
+     * Marking only the head leaves the rest of the flight inside
+     * packets_out, so tcp_packets_in_flight() reports the tail as still in
+     * the network and the collapse computes a window far above 1.
+     */
+    void TestRtoMarksWholeFlightLost() {
+        static bool registered = false;
+        if (!registered) {
+            XtcpCongestionOps ops;
+            ops.name = "rto_flight_lost";
+            ops.ssthresh = KccShapeSsthresh;   // passthrough -> plugin branch
+            CHECK(xtcp::cc::RegisterCongestionControl(ops));
+            registered = true;
+        }
+        std::vector<xtcp::buf::BufRef> tx;
+        xtcp::core::TcpConn conn(
+            xtcp::core::TcpState::kEstablished, LocalEp(), RemoteEp(), 100, 200,
+            [&tx](xtcp::buf::BufRef&& p) { tx.push_back(std::move(p)); });
+        conn.SetPeerMss(kMss);
+        conn.SetSackOk(true);
+        conn.SetSndBuf(8u << 20);
+        CHECK(conn.SetCongestionControl("rto_flight_lost"));
+        xtcp::core::TimePoint now = 1000;
+        for (UInt32 i = 0; i < 4; ++i) {
+            std::vector<Byte> buf(kMss, 0x41);
+            CHECK(conn.SendData(buf.data(), kMss, now));
+        }
+        CHECK(4u * kMss == conn.SndInflight());
+        // No SACK, no ACK: the whole 4-segment flight is unconfirmed.
+        now += 3000000;
+        conn.OnRetransmitTimer(now);
+        std::fprintf(stderr,
+                     "[rto-flight] lost_out=%u retrans_out=%u pipe=%u cwnd=%u\n",
+                     conn.LostOutPkts(), conn.RetransOutPkts(),
+                     conn.PipeInFlightBytesPublic(), conn.Cwnd());
+        // tcp_timeout_mark_lost marks all four; the head is then retransmitted,
+        // so retrans_out is 1 and lost_out is 4 (the kernel does NOT clear
+        // TCPCB_LOST when a lost segment is retransmitted: tcp_retransmit_skb
+        // only sets TCPCB_SACKED_RETRANS).
+        CHECK(4u == conn.LostOutPkts());
+        CHECK(1u == conn.RetransOutPkts());
+        // packets_out(4) - left_out(4) + retrans_out(1) = 1 segment in flight.
+        CHECK(kMss == conn.PipeInFlightBytesPublic());
+        // tcp_enter_loss computes cwnd BEFORE tcp_retransmit_skb runs, i.e.
+        // with retrans_out still 0: packets_in_flight() = 4 - 4 + 0 = 0, so
+        // the collapse is tcp_packets_in_flight() + 1 = 1.
+        CHECK(1u == conn.Cwnd());
+        CHECK(conn.PipeInFlightBytesPublic() == conn.PipeWalkReference());
+    }
+    /**
      * @brief The O(1) in-flight counters must always equal the queue walk.
      *
      * PipeInFlightBytes() is now maintained incrementally (pipe_sacked_bytes_ /
@@ -4279,21 +4348,29 @@ namespace {
             h.Send(kMss);
         }
         const UInt32 una = h.conn.SndUna();
-        // RTO marks the head lost (kernel tcp_timeout_mark_lost) and
-        // retransmits it.
+        // RTO marks the WHOLE un-SACKed flight lost (kernel
+        // tcp_timeout_mark_lost walks the rbtree, tcp_input_66.c:2140-2148)
+        // and retransmits the head.
         h.now += 3000000;
         h.conn.OnRetransmitTimer(h.now);
         std::fprintf(stderr, "[B7A4] after RTO lost_out=%u retrans_out=%u\n",
                      h.conn.LostOutPkts(), h.conn.RetransOutPkts());
-        CHECK(1 == h.conn.LostOutPkts());
+        CHECK(4 == h.conn.LostOutPkts());
         // The peer SACKs the retransmitted head completely: the kernel
-        // removes it from lost_out (and from retrans_out).
+        // removes it from lost_out (and from retrans_out). The three still
+        // un-SACKed tail segments stay lost until they are delivered.
         h.now += 20000;
         h.Deliver(una, xtcp::core::kFlagAck, 65535, true, una, una + kMss);
         std::fprintf(stderr, "[B7A4] after SACK: lost_out=%u retrans_out=%u\n",
                      h.conn.LostOutPkts(), h.conn.RetransOutPkts());
-        CHECK(0 == h.conn.LostOutPkts());   // red: still 1
-        // cond4 of tcp_rate_check_app_limited must be satisfiable again.
+        CHECK(3 == h.conn.LostOutPkts());
+        // cond4 of tcp_rate_check_app_limited must be satisfiable again once
+        // the tail drains: SACK the remaining three.
+        h.Deliver(una + kMss, xtcp::core::kFlagAck, 65535, true,
+                  una + kMss, una + 4 * kMss);
+        std::fprintf(stderr, "[B7A4] after tail SACK: lost_out=%u retrans_out=%u\n",
+                     h.conn.LostOutPkts(), h.conn.RetransOutPkts());
+        CHECK(0 == h.conn.LostOutPkts());
         CHECK(h.conn.LostOutPkts() <= h.conn.RetransOutPkts());
     }
     /**
@@ -4513,6 +4590,7 @@ int main() {
     TestMigrationKeepsRetransTag();
     TestMigrationClearsOooBytes();
     TestKccPipeExcludesLost();
+    TestRtoMarksWholeFlightLost();
     TestPipeCountersMatchWalk();
     TestPipeCountersRandomized();
     TestCcInflightExcludesSacked();

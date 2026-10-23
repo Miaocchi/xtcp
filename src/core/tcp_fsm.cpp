@@ -1861,10 +1861,34 @@ namespace xtcp {
             // adjudication simply waits for the rest of the segment).
             rto_retx_end_ = retrans_queue_.empty()
                 ? 0 : (retrans_queue_.front().seq + retrans_queue_.front().len);
-            // Kernel tcp_timeout_mark_lost (tcp_input.c:1121): the RTO marks
-            // the unacknowledged head as lost BEFORE the window cut, so
-            // lost_out reflects the verdict even if the retransmit is skipped
-            // (zero window) or fails to allocate.
+            // Kernel tcp_timeout_mark_lost (tcp_input_66.c:2123-2151): the RTO
+            // walks the WHOLE retransmit tree and marks every skb that is not
+            // TCPCB_SACKED_ACKED lost, before the window cut:
+            //
+            //     skb = head;
+            //     skb_rbtree_walk_from(skb) {
+            //         if (is_reneg) ...
+            //         else if (tcp_is_rack(sk) && skb != head &&
+            //                  tcp_rack_skb_timeout(tp, skb, 0) > 0)
+            //             continue;   // recently sent: not lost yet
+            //         tcp_mark_skb_lost(sk, skb);
+            //     }
+            //
+            // tcp_mark_skb_lost (:1121) then does lost_out += pcount for each.
+            // Marking only the head leaves the tail inside packets_out, so the
+            // following tcp_enter_loss collapse
+            //   cwnd = tcp_packets_in_flight(tp) + 1
+            // (:2174) counts segments the kernel has already declared lost -
+            // the post-timeout window comes out far above 1 (audit D14).
+            //
+            // The RACK arm (`skb != head && tcp_rack_skb_timeout > 0`) keeps
+            // recently sent segments out of the loss set. The port has no
+            // per-skb RACK timer: RackDetectLoss (:2739) runs the time-based
+            // verdict on the ACK path and the RTO is the coarse fallback, so
+            // every un-SACKed segment is treated as lost - the conservative
+            // direction the kernel takes when RACK is not enabled
+            // (tcp_is_rack() false). Marking MORE segments lost lowers the
+            // collapse window; it never inflates it.
             for (SentSeg& s : retrans_queue_) {
                 if (s.sacked >= s.len) {
                     continue;   // already delivered by SACK
@@ -1875,7 +1899,6 @@ namespace xtcp {
                     // LOST takes the segment out of the pipe: re-account it.
                     PipeReaccountSeg(s, s.sacked, 0, s.is_retrans);
                 }
-                break;          // only the retransmission head is marked
             }
             // Kernel tcp_enter_loss guard (tcp_input_66.c:2165-2173): the
             // reduction (ssthresh/prior_ssthresh/prior_cwnd) is recomputed
