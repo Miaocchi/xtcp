@@ -3489,6 +3489,19 @@ namespace {
                 // RTO: marks the head LOST and retransmits.
                 h.now += 3000000;
                 h.conn.OnRetransmitTimer(h.now);
+            } else if (op < 88) {
+                // Zero-window persist probe: re-sends the queue front and sets
+                // its TCPCB_SACKED_RETRANS (a path that must also re-account
+                // the pipe).
+                h.now += 1000;
+                h.Deliver(h.conn.SndUna(), xtcp::core::kFlagAck, 0);  // window 0
+                h.now += 1000000;
+                h.conn.OnPersistTimer(h.now);
+            } else if (op < 92) {
+                // TLP probe: re-sends the queue TAIL, also marking it
+                // TCPCB_SACKED_RETRANS without touching `retries`.
+                h.now += 2000000;
+                h.conn.OnPoll(h.now);
             } else if (op < 96) {
                 // Cumulative ACK advancing by one segment (pops the head).
                 const UInt32 una = h.conn.SndUna();
@@ -3562,6 +3575,9 @@ namespace {
             h.now += 60000;
             h.conn.OnPoll(h.now);
             CHECK(before + 1 == g_recTxStart);   // probe on an empty pipe
+            // The probe marked the tail TCPCB_SACKED_RETRANS without touching
+            // `retries`; the O(1) pipe sum must still agree with the walk.
+            CHECK(h.conn.PipeInFlightBytesPublic() == h.conn.PipeWalkReference());
         }
         {
             // Non-empty pipe: the same probe must NOT dispatch TX_START.
@@ -3572,6 +3588,7 @@ namespace {
             h.now += 60000;                      // past 2*srtt, before the RTO
             h.conn.OnPoll(h.now);
             CHECK(before == g_recTxStart);       // pipe non-empty: no TX_START
+            CHECK(h.conn.PipeInFlightBytesPublic() == h.conn.PipeWalkReference());
         }
     }
 

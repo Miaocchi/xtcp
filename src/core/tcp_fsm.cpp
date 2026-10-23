@@ -4473,7 +4473,14 @@ namespace xtcp {
                             front.sent_delivered_pkts = cc_.delivered_pkts;
                             front.pkt_count = PktCount(front.len, peer_mss_);
                             front.app_limited = (0 != cc_.app_limited) ? 1 : 0;
+                            const Byte old_is_retrans = front.is_retrans;
                             front.is_retrans = 1;
+                            // TCPCB_SACKED_RETRANS just got set on a segment
+                            // that may have had it clear: re-account its pipe
+                            // contribution, or retrans_out and the pipe sum
+                            // disagree.
+                            PipeReaccountSeg(front, front.sacked, front.lost,
+                                             old_is_retrans);
                             // Kernel tcp_event_data_sent: a persist
                             // re-probe carries data, so it is a TX_START candidate.
                             NotifyTxStart(0 == PipeInFlightBytes());
@@ -4599,7 +4606,11 @@ namespace xtcp {
                         tail.sent_delivered_pkts = cc_.delivered_pkts;
                         tail.pkt_count = PktCount(tail.len, peer_mss_);
                         tail.app_limited = (0 != cc_.app_limited) ? 1 : 0;
+                        const Byte old_is_retrans = tail.is_retrans;
                         tail.is_retrans = 1;
+                        // See the persist path: TCPCB_SACKED_RETRANS may have
+                        // been clear, so the pipe term needs re-accounting.
+                        PipeReaccountSeg(tail, tail.sacked, tail.lost, old_is_retrans);
                         // Kernel tcp_send_loss_probe -> tcp_retransmit_skb:
                         // tp->total_retrans += tcp_skb_pcount(skb).
                         // MUST run BEFORE sink_: a synchronous backend delivers
