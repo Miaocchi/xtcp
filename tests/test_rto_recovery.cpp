@@ -227,36 +227,19 @@ int main() {
         UInt64 accepted = 0;
         const UInt32 kDropEvery = 8;  // 1 in 8 data segments (~12.5%)
         UInt32 guard = 0;
-        const UInt64 t0 = NowUs();
-        while (accepted < kTotal && 400000 > ++guard) {
-            UInt32 n = static_cast<UInt32>(kTotal - accepted);
-            if (n > 4096) {
-                n = 4096;
-            }
-            UInt32 tries = 0;
-            while (!stack_a.Send(conn, payload.data() + accepted, n) && 500 > ++tries) {
-                PumpLossy(backend_a, backend_b, stack_a, stack_b, kDropEvery, drop, seen, dropped_seqs);
-                PumpLossy(backend_b, backend_a, stack_a, stack_b, 0, drop, seen, dropped_seqs);
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            accepted += n;
-            PumpLossy(backend_a, backend_b, stack_a, stack_b, kDropEvery, drop, seen, dropped_seqs);
-            PumpLossy(backend_b, backend_a, stack_a, stack_b, 0, drop, seen, dropped_seqs);
-        }
-        CHECK(kTotal == accepted);
-
-        // Drain + observe the RTO deadline while segments are still being
-        // recovered. Both stack and test read the same steady_clock in us, so
-        // (rto_deadline - now) is the armed RTO wait.
+        // RTO-deadline observation state. Sampling must cover the SEND phase
+        // too: on a fast loopback the loss recovery (RFC 8985 TLP probes)
+        // completes while the payload is still being queued, so a drain-only
+        // sample window can miss every retransmit and leave fresh_samples==0
+        // (the observed CI flake). The assertions themselves are unchanged -
+        // only the observation window widens to the whole transfer.
         UInt64 max_gap = 0;         // upper bound: closest any armed wait came to the ceiling
         UInt64 min_fresh_gap = 0;   // lower bound: smallest freshly-armed wait after a retransmit
         UInt32 fresh_samples = 0;
         UInt32 prev_retx = 0;
         UInt32 min_ssthresh = 0xFFFFFFFFu;
         UInt32 max_inflight = 0;
-        for (UInt32 i = 0; i < 3000 && bytes_recv < kTotal; ++i) {
-            PumpLossy(backend_a, backend_b, stack_a, stack_b, kDropEvery, drop, seen, dropped_seqs);
-            PumpLossy(backend_b, backend_a, stack_a, stack_b, 0, drop, seen, dropped_seqs);
+        auto sample = [&]() {
             UInt32 inflight = 0, cwnd = 0, ssthresh = 0, snd_wnd = 0, retx = 0, dup = 0, fast = 0;
             UInt64 rto_deadline = 0;
             UInt32 front_seq = 0, snd_una = 0;
@@ -285,6 +268,34 @@ int main() {
                 }
             }
             prev_retx = retx;
+        };
+        const UInt64 t0 = NowUs();
+        while (accepted < kTotal && 400000 > ++guard) {
+            UInt32 n = static_cast<UInt32>(kTotal - accepted);
+            if (n > 4096) {
+                n = 4096;
+            }
+            UInt32 tries = 0;
+            while (!stack_a.Send(conn, payload.data() + accepted, n) && 500 > ++tries) {
+                PumpLossy(backend_a, backend_b, stack_a, stack_b, kDropEvery, drop, seen, dropped_seqs);
+                PumpLossy(backend_b, backend_a, stack_a, stack_b, 0, drop, seen, dropped_seqs);
+                sample();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            accepted += n;
+            PumpLossy(backend_a, backend_b, stack_a, stack_b, kDropEvery, drop, seen, dropped_seqs);
+            PumpLossy(backend_b, backend_a, stack_a, stack_b, 0, drop, seen, dropped_seqs);
+            sample();
+        }
+        CHECK(kTotal == accepted);
+
+        // Drain: finish any delivery still outstanding while continuing to
+        // sample. Both stack and test read the same steady_clock in us, so
+        // (rto_deadline - now) is the armed RTO wait.
+        for (UInt32 i = 0; i < 3000 && bytes_recv < kTotal; ++i) {
+            PumpLossy(backend_a, backend_b, stack_a, stack_b, kDropEvery, drop, seen, dropped_seqs);
+            PumpLossy(backend_b, backend_a, stack_a, stack_b, 0, drop, seen, dropped_seqs);
+            sample();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         const UInt64 elapsed_us = NowUs() - t0;
