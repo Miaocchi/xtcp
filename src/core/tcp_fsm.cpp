@@ -1555,10 +1555,8 @@ namespace xtcp {
             while (!retrans_queue_.empty()) {
                 SentSeg seg = std::move(retrans_queue_.front());
                 retrans_queue_.pop_front();
-                // Keep the O(1) pipe sums in step with the queue. The
-                // re-split segments are re-inserted below, so remove this one's
-                // contribution first.
-                PipeAccountSeg(seg, -1);
+                // The pipe sums are rebuilt wholesale at the end of this
+                // function, so no per-segment subtraction is needed here.
                 if (seg.len <= new_mss) {
                     resplit.push_back(std::move(seg));
                     continue;
