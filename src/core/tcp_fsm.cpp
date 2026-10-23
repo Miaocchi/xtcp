@@ -3966,9 +3966,16 @@ namespace xtcp {
                             retrans_stamp_ts_ = 0;
                         }
                     } else {
-                        // Real gaps remain: the loss signal is confirmed, so a
-                        // no-SACK entry may not undo.
-                        undo_marker_ = false;
+                        // Real gaps remain: the partial ACK does not close the
+                        // episode, but it does NOT invalidate the undo
+                        // candidate either. The kernel's tcp_try_undo_partial
+                        // leaves tp->undo_marker alone on the no-undo path -
+                        // only a SUCCESSFUL undo (tcp_try_undo_recovery,
+                        // :2526), ECN (tcp_enter_cwr, :2692), a simple
+                        // retransmit (:2812) or tcp_clear_retrans (:2101)
+                        // clears it. A D-SACK arriving later in this same
+                        // episode must still be able to prove the
+                        // retransmission spurious (audit D17).
                         // RFC 6675: a partial ACK (with SACK-implied gaps
                         // remaining) itself drives the recovery - retransmit
                         // the next missing segment immediately instead of
@@ -4205,9 +4212,16 @@ namespace xtcp {
                             cc_.snd_cwnd += 1;
                         }
                     } else {
-                        // SACK blocks during a no-SACK entry = the loss is
-                        // confirmed after all: no undo.
-                        undo_marker_ = false;
+                        // SACK blocks during the recovery: they narrow the
+                        // loss set but do NOT invalidate the undo candidate.
+                        // The kernel clears tp->undo_marker only in
+                        // tcp_clear_retrans (:2101), tcp_try_undo_recovery on
+                        // success (:2526), tcp_enter_cwr for ECN (:2692),
+                        // tcp_simple_retransmit (:2812) and the SYN-timeout
+                        // path (:6214) - never because an ordinary SACK block
+                        // arrived. Clearing it here made every D-SACK-confirmed
+                        // spurious retransmission inside a SACK recovery
+                        // impossible to undo (audit D17).
                         // Zero-info guard: SACK blocks at/below the cum-ACK add NO new
                         // information (the Linux peer re-ACKs already-ACKed
                         // data on a lossless link). RetransmitEarliestMissing
