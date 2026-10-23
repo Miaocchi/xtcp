@@ -771,7 +771,7 @@ namespace xtcp {
                             out.sack[b][0] = Load32(data + off + 2 + b * 8);
                             out.sack[b][1] = Load32(data + off + 6 + b * 8);
                         }
-                        // RFC 2018 间: the first SACK block is the most
+                        // RFC 2018 �? the first SACK block is the most
                         // recently received block, so a compliant peer may
                         // send blocks most-recent-first. The sender-side
                         // recovery walk (RetransmitEarliestMissing) iterates
@@ -1146,7 +1146,7 @@ namespace xtcp {
                 out[n * 2 + 1] = cur_right;
                 ++n;
             }
-            // RFC 2018 间: the first SACK block must be the most recently
+            // RFC 2018 �? the first SACK block must be the most recently
             // received block. ooo_ is keyed by seq (no insertion order), so
             // approximate "most recent" with the largest-seq block - the last
             // emitted (blocks above are ascending). Swap it into slot 0.
@@ -1334,7 +1334,7 @@ namespace xtcp {
                 rto_deadline_ = 0;
                 return;
             }
-            // RFC 1122 间.2.2.17: a retransmission must fit the peer's
+            // RFC 1122 �?2.2.17: a retransmission must fit the peer's
             // advertised window. A zero window takes no data - the persist
             // probe owns that state, so skip the transmit (re-arm below) and
             // wait for a window-opening ACK instead of emitting an out-of-
@@ -1721,7 +1721,7 @@ namespace xtcp {
                                       static_cast<UInt16>(window_ >> kWindowScaleOffer), sink_,
                                       kWindowScaleOffer, Md5Key(), Md5KeyLen(), NULLPTR, 0, NULLPTR);
                 }
-                // RFC 1122 间.2.3.5: handshake retransmits back off
+                // RFC 1122 �?2.3.5: handshake retransmits back off
                 // exponentially, mirroring RetransmitFront's seg.rto doubling
                 // (tcp_fsm.cpp:1075-1082) - a fixed rto_ re-arm fires the whole
                 // syn_retries_ budget at a constant 1 s (Linux ~127 s for 6
@@ -1760,7 +1760,7 @@ namespace xtcp {
                                   NULLPTR, 0, AdvertisedWindow(), sink_, rcv_wscale_,
                                   Md5Key(), Md5KeyLen(), NULLPTR, 0, cookie, false,
                                   false, 0, 0, !sack_ok_);
-                // RFC 1122 间.2.3.5: the SYN+ACK retransmit backs off
+                // RFC 1122 �?2.3.5: the SYN+ACK retransmit backs off
                 // exponentially (mirror of RetransmitFront seg.rto doubling,
                 // tcp_fsm.cpp:1075-1082), not a fixed rto_ re-arm.
                 syn_rto_ = (0 == syn_rto_) ? rto_ : syn_rto_;
@@ -1805,7 +1805,7 @@ namespace xtcp {
                 }
                 ++syn_retry_count_;
                 SendSegment(snd_nxt_ - 1, rcv_nxt_, kFlagFin | kFlagAck, NULLPTR, 0);
-                // RFC 1122 间.2.3.5: the FIN retransmit backs off exponentially
+                // RFC 1122 �?2.3.5: the FIN retransmit backs off exponentially
                 // (mirror of RetransmitFront seg.rto doubling, tcp_fsm.cpp:1081-1087). With a fixed rto_ re-arm the close gave up after
                 // 15 s (15 x 1 s); now it doubles 1,2,4,... capped at 60 s.
                 fin_rto_ = (0 == fin_rto_) ? rto_ : fin_rto_;
@@ -2552,7 +2552,7 @@ namespace xtcp {
                         // SACK block (stale, or landed exactly on a block's
                         // left edge after a single-segment gap retransmit):
                         // jump to the current gap's start - never retransmit
-                        // already-received data (RFC 6675 间).
+                        // already-received data (RFC 6675 �?.
                         missing = static_cast<UInt32>(cursor);
                         break;
                     }
@@ -2587,14 +2587,14 @@ namespace xtcp {
                 // Find the queued segment covering the missing sequence.
                 for (SentSeg& seg : retrans_queue_) {
                     if (!SeqLt(missing, seg.seq) && SeqLt(missing, seg.seq + seg.len)) {
-                        // RFC 1122 间.2.2.17: the retransmission must fit the
+                        // RFC 1122 �?2.2.17: the retransmission must fit the
                         // peer's advertised window. A zero window takes no data -
                         // skip the transmit and wait for a window-opening ACK (the
                         // persist probe, when armed, re-arms the RTO path).
                         if (0 == snd_wnd_) {
                             return;
                         }
-                        // RFC 6675 间: retransmit ONLY the missing interval, not
+                        // RFC 6675 �? retransmit ONLY the missing interval, not
                         // the whole queued segment. When the missing point lies
                         // inside the segment, the prefix [seg.seq, missing) is
                         // already SACKed/delivered - resending it makes the peer
@@ -2838,6 +2838,29 @@ namespace xtcp {
                 prior_cwnd_ = cc_.snd_cwnd;
                 prior_ssthresh_ = cc_.snd_ssthresh;
             }
+            // Kernel tcp_enter_recovery (tcp_input_66.c:2816-2839) calls
+            // tcp_init_undo unconditionally (:2826), arming the undo candidate
+            // for the episode:
+            //
+            //     tp->undo_marker  = tp->snd_una;
+            //     tp->undo_retrans = tp->retrans_out ?: -1;
+            //
+            // RACK enters recovery through that same function, so a
+            // RACK-driven episode IS undoable: a D-SACK proving the
+            // retransmission was spurious must restore the window. The port
+            // left undo_marker_ at whatever the previous episode left behind,
+            // so once the D-SACK path was gated on it a RACK recovery could
+            // never be undone (test_dsack: the duplicate was recognized but
+            // the restore was refused).
+            //
+            // A SACK-verified gap is a real loss signal, which is why the
+            // dup-ACK entry clears the marker for SACK-bearing ACKs
+            // (:3961). RACK differs: its verdict is TIME-based, so a merely
+            // reordered segment trips it exactly like a lost one - the
+            // spurious case is live and the candidate must be armed.
+            undo_marker_ = true;
+            undo_retrans_ = (retrans_out_pkts_ > 0)
+                ? static_cast<Int32>(retrans_out_pkts_) : -1;
             // A new episode owns its own RTO verdict: an RTO retrans_stamp left
             // over from an earlier episode must not be adjudicated against this
             // one (kernel clears retrans_stamp on the recovery entry paths).
@@ -2937,7 +2960,40 @@ namespace xtcp {
                 // several packets.
                 const UInt32 ds_sl = opts->sack[0][0];
                 const UInt32 ds_sr = opts->sack[0][1];
-                if (!SeqLt(ack, ds_sr) && SeqLt(ds_sl, ds_sr)) {
+                // Kernel tcp_check_dsack (tcp_input_66.c:1274-1284) has TWO
+                // arms that classify block 0 as a duplicate:
+                //
+                //     if (before(start_seq_0, ack_seq)) {
+                //         ...                              // plain D-SACK
+                //     } else if (num_sacks > 1) {
+                //         end_seq_1   = sp[1].end_seq;
+                //         start_seq_1 = sp[1].start_seq;
+                //         if (after(end_seq_0, end_seq_1) ||
+                //             before(start_seq_0, start_seq_1))
+                //             return false;
+                //         ...                              // DSACK of O-FO
+                //     } else {
+                //         return false;
+                //     }
+                //
+                // The port only implemented the first arm, so a peer that
+                // reports the duplicate as the FIRST of two blocks - the shape
+                // Linux itself emits when the duplicated data is out of order
+                // - was not recognized at all: the spurious retransmission was
+                // never credited, dsack_dups never moved, and the D-SACK undo
+                // could never fire (audit D17).
+                const bool dsack_plain = SeqLt(ds_sl, ack);
+                bool dsack_ofo = false;
+                if (!dsack_plain && 1 < opts->sack_count) {
+                    const UInt32 sl1 = opts->sack[1][0];
+                    const UInt32 sr1 = opts->sack[1][1];
+                    // block0 must sit INSIDE block1: !after(sr0, sr1) &&
+                    // !before(sl0, sl1)  ->  sr0 <= sr1 && sl1 <= sl0.
+                    if (!SeqLt(sr1, ds_sr) && !SeqLt(ds_sl, sl1)) {
+                        dsack_ofo = true;
+                    }
+                }
+                if ((dsack_plain || dsack_ofo) && SeqLt(ds_sl, ds_sr)) {
                     const UInt32 ds_len = ds_sr - ds_sl;
                     if (ds_len <= max_window_) {
                         const UInt32 dup_segs = (0 < peer_mss_ && ds_len > peer_mss_)
@@ -2963,18 +3019,67 @@ namespace xtcp {
                             // for the rest of the connection (audit D16).
                             //
                             // `!after(end_seq_0, prior_snd_una)`: the duplicate
-                            // must sit at/below the pre-ACK cumulative frontier.
-                            // `after(end_seq_0, undo_marker)`: it must be data
-                            // sent inside the episode being undone - the port's
-                            // undo_marker_ is a bool (the kernel's is a
-                            // sequence), so the episode's own anchor is
-                            // high_seq_; every accepted D-SACK overlaps a
-                            // retransmission inside the current episode by
-                            // construction (dsack_overlap below), so the
-                            // sequence compare reduces to that check.
-                            if (undo_marker_ && 0 < undo_retrans_) {
+                            // must sit at/below the PRE-ACK cumulative frontier.
+                            // snd_una_ still holds that value here - the
+                            // assignment runs later in OnAckReceived
+                            // (tcp_fsm.cpp:3494), matching the kernel's
+                            // `prior_snd_una = tp->snd_una` capture before the
+                            // update (tcp_input_66.c:3790).
+                            // `after(end_seq_0, undo_marker)`: the duplicate
+                            // must cover data sent inside the episode being
+                            // undone. The port's undo_marker_ is a bool (the
+                            // kernel's is a sequence = the entry's snd_una,
+                            // tcp_init_undo at :2108), so the sequence compare
+                            // cannot be reproduced directly; the enclosing
+                            // dsack_overlap check - the block must overlap a
+                            // RETRANSMITTED segment - is the port's equivalent
+                            // anchor, since only this episode's retransmissions
+                            // can carry retries > 0 while undo_marker_ holds.
+                            if (undo_marker_ && 0 < undo_retrans_ &&
+                                !SeqLt(snd_una_, ds_sr)) {
                                 undo_retrans_ = (undo_retrans_ > static_cast<Int32>(dup_segs))
                                     ? undo_retrans_ - static_cast<Int32>(dup_segs) : 0;
+                            }
+                            // Kernel tcp_sacktag_one (tcp_input_66.c:1370-1374),
+                            // the SECOND undo_retrans decrement - and the one
+                            // that governs a D-SACK covering data still in the
+                            // retransmit queue (the tcp_check_dsack arm above
+                            // only fires for data already forgotten, i.e. at or
+                            // below the PRE-ACK cumulative frontier):
+                            //
+                            //     if (dup_sack && (sacked & TCPCB_RETRANS)) {
+                            //         if (tp->undo_marker && tp->undo_retrans > 0 &&
+                            //             after(end_seq, tp->undo_marker))
+                            //             tp->undo_retrans =
+                            //                 max_t(int, 0, tp->undo_retrans - pcount);
+                            //         ...
+                            //     }
+                            //
+                            // TCPCB_RETRANS marks a skb that HAS been
+                            // retransmitted, which is the port's `retries > 0`
+                            // (NOT `is_retrans`, the TCPCB_SACKED_RETRANS twin).
+                            // `after(end_seq, undo_marker)`: undo_marker is the
+                            // episode entry's snd_una, and every segment this
+                            // episode retransmitted starts at or above it, so a
+                            // DSACK overlapping one of them satisfies the test by
+                            // construction.
+                            if (undo_marker_ && 0 < undo_retrans_) {
+                                for (const SentSeg& seg : retrans_queue_) {
+                                    if (0 == seg.retries) {
+                                        continue;
+                                    }
+                                    const UInt32 seg_end = seg.seq + seg.len;
+                                    if (SeqLt(ds_sr, seg.seq)) {
+                                        break;   // queue is seq-sorted
+                                    }
+                                    if (SeqLt(ds_sl, seg_end) && SeqLt(seg.seq, ds_sr)) {
+                                        undo_retrans_ = (undo_retrans_ > static_cast<Int32>(seg.pkt_count))
+                                            ? undo_retrans_ - static_cast<Int32>(seg.pkt_count) : 0;
+                                        if (0 >= undo_retrans_) {
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -4012,7 +4117,23 @@ namespace xtcp {
                     // (real gaps) never undo.
                     prior_cwnd_ = cc_.snd_cwnd;
                     prior_ssthresh_ = cc_.snd_ssthresh;
-                    undo_marker_ = (NULLPTR == opts || 0 == opts->sack_count);
+                    // Kernel tcp_enter_recovery (tcp_input_66.c:2816-2839)
+                    // calls tcp_init_undo UNCONDITIONALLY (:2826):
+                    //
+                    //     tp->undo_marker  = tp->snd_una;
+                    //     tp->undo_retrans = tp->retrans_out ?: -1;
+                    //
+                    // There is no SACK/no-SACK distinction: a SACK-driven
+                    // recovery is just as undoable as a dup-ACK one, because
+                    // the actual undo still needs EVIDENCE - a D-SACK covering
+                    // the retransmission (tcp_try_undo_dsack, :2580) or
+                    // tcp_packet_delayed. The port used to arm the candidate
+                    // only for SACK-less entries, so a spurious retransmission
+                    // confirmed by a D-SACK inside a SACK-driven episode could
+                    // never be undone (audit D17).
+                    undo_marker_ = true;
+                    undo_retrans_ = (retrans_out_pkts_ > 0)
+                        ? static_cast<Int32>(retrans_out_pkts_) : -1;
                     // Kernel dup-ACK loss marking (tcp_mark_head_lost): the
                     // head of the retransmission queue becomes TCPCB_LOST at
                     // the fast-retransmit decision.
@@ -5275,7 +5396,7 @@ namespace xtcp {
         }
 
         void TcpConn::SendChallengeAck() noexcept {
-            // RFC 5961 间 / Linux tcp_challenge_ack_limit: a spoofed flood of
+            // RFC 5961 �?/ Linux tcp_challenge_ack_limit: a spoofed flood of
             // out-of-window RSTs must NOT reflect 1:1 into challenge ACKs.
             // Allow up to kChallengeAckLimit per 1s window; excess challenges
             // are dropped silently (the connection is simply not closed).

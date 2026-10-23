@@ -4559,6 +4559,103 @@ namespace {
         CHECK(ssth_sack == h.conn.Ssthresh());
     }
 
+    /** @brief Raw ACK carrying TWO SACK blocks (RFC 2018 option, 40 bytes). */
+    std::vector<Byte> BuildSegTwoSack(UInt16 sport, UInt16 dport, UInt32 seq,
+                                      UInt32 ack, UInt16 flags, UInt16 window,
+                                      UInt32 sl0, UInt32 sr0,
+                                      UInt32 sl1, UInt32 sr1) {
+        // TCP 20 + two NOPs + SACK option (2 + 16) = 40 bytes, so the data
+        // offset is 10 * 4.
+        std::vector<Byte> seg(40, 0);
+        Byte* t = seg.data();
+        t[0] = static_cast<Byte>(sport >> 8); t[1] = static_cast<Byte>(sport & 0xFF);
+        t[2] = static_cast<Byte>(dport >> 8); t[3] = static_cast<Byte>(dport & 0xFF);
+        t[4] = static_cast<Byte>(seq >> 24); t[5] = static_cast<Byte>(seq >> 16);
+        t[6] = static_cast<Byte>(seq >> 8); t[7] = static_cast<Byte>(seq & 0xFF);
+        t[8] = static_cast<Byte>(ack >> 24); t[9] = static_cast<Byte>(ack >> 16);
+        t[10] = static_cast<Byte>(ack >> 8); t[11] = static_cast<Byte>(ack & 0xFF);
+        t[12] = 0xA0;   // data offset 10 * 4 = 40
+        t[13] = static_cast<Byte>(((flags & xtcp::core::kFlagFin) ? 0x01 : 0x00) |
+                                  ((flags & xtcp::core::kFlagSyn) ? 0x02 : 0x00) |
+                                  ((flags & xtcp::core::kFlagRst) ? 0x04 : 0x00) |
+                                  ((flags & xtcp::core::kFlagPsh) ? 0x08 : 0x00) |
+                                  ((flags & xtcp::core::kFlagAck) ? 0x10 : 0x00) |
+                                  ((flags & xtcp::core::kFlagEce) ? 0x40 : 0x00));
+        t[14] = static_cast<Byte>(window >> 8);
+        t[15] = static_cast<Byte>(window & 0xFF);
+        t[20] = 1; t[21] = 1;   // NOP, NOP
+        t[22] = 5; t[23] = 18;  // SACK, length 18: two 8-byte blocks
+        t[24] = static_cast<Byte>(sl0 >> 24); t[25] = static_cast<Byte>(sl0 >> 16);
+        t[26] = static_cast<Byte>(sl0 >> 8);  t[27] = static_cast<Byte>(sl0 & 0xFF);
+        t[28] = static_cast<Byte>(sr0 >> 24); t[29] = static_cast<Byte>(sr0 >> 16);
+        t[30] = static_cast<Byte>(sr0 >> 8);  t[31] = static_cast<Byte>(sr0 & 0xFF);
+        t[32] = static_cast<Byte>(sl1 >> 24); t[33] = static_cast<Byte>(sl1 >> 16);
+        t[34] = static_cast<Byte>(sl1 >> 8);  t[35] = static_cast<Byte>(sl1 & 0xFF);
+        t[36] = static_cast<Byte>(sr1 >> 24); t[37] = static_cast<Byte>(sr1 >> 16);
+        t[38] = static_cast<Byte>(sr1 >> 8);  t[39] = static_cast<Byte>(sr1 & 0xFF);
+        return seg;
+    }
+
+    /**
+     * @brief DSACK-of-OFO: with two SACK blocks the FIRST block is a duplicate
+     *        when it sits inside the second.
+     *
+     * Kernel tcp_check_dsack (tcp_input_66.c:1274-1284):
+     *
+     *     if (before(start_seq_0, TCP_SKB_CB(ack_skb)->ack_seq)) {
+     *         ...                                  // plain D-SACK
+     *     } else if (num_sacks > 1) {
+     *         u32 end_seq_1   = sp[1].end_seq;
+     *         u32 start_seq_1 = sp[1].start_seq;
+     *         if (after(end_seq_0, end_seq_1) ||
+     *             before(start_seq_0, start_seq_1))
+     *             return false;
+     *         ...                                  // DSACK of O-FO
+     *     } else {
+     *         return false;
+     *     }
+     *
+     * The port only implemented the first arm: a block at/below the cumulative
+     * ACK. A peer that reports the duplicate as the first of two blocks - the
+     * shape Linux itself sends when the duplicate is out-of-order - was
+     * therefore not recognized at all, so the spurious retransmission was
+     * never credited and the undo never became possible.
+     */
+    void TestDsackOfOutOfOrderRecognized() {
+        FsmHarness h;
+        h.conn.SetSackOk(true);
+        h.Warm();
+        h.conn.SetSndBuf(4u << 20);
+        for (UInt32 i = 0; i < 6; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        // A retransmission so total_retrans_pkts_ can carry a DSACK.
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);
+        CHECK(1 == h.conn.RetransmitCount());
+        const UInt64 base = h.conn.DeliveredPkts();
+        const UInt32 dups = h.conn.DsackDups();
+        // The cumulative ACK does NOT advance (ack == una), so block0
+        // [una, una+kMss) is NOT below the frontier: the kernel's FIRST arm
+        // (before(start_seq_0, ack_seq)) is false and only the multi-block arm
+        // can classify it. block0 sits INSIDE block1, which is exactly the
+        // DSACK-of-O-FO shape a peer produces for an out-of-order duplicate.
+        const std::vector<Byte> seg = BuildSegTwoSack(
+            443, 40000, 201, una, xtcp::core::kFlagAck, 65535,
+            una, una + kMss, una, una + 3 * kMss);
+        h.now += 20000;
+        h.conn.OnSegment(seg.data(), static_cast<UInt32>(seg.size()), h.now);
+        std::fprintf(stderr,
+                     "[dsack-ofo] delivered %llu -> %llu dups %u -> %u\n",
+                     static_cast<unsigned long long>(base),
+                     static_cast<unsigned long long>(h.conn.DeliveredPkts()),
+                     dups, h.conn.DsackDups());
+        // Kernel accepts block0 as a duplicate: dsack_dups moves by one and
+        // tcp_dsack_seen credits dup_segs (= 1) to state->sack_delivered.
+        CHECK(dups + 1 == h.conn.DsackDups());
+    }
+
     /**
      * @brief B3: a DSACK block longer than tp->max_window is dubious and
      *        must be rejected (tcp_input_66.c:1015-1017). tp->max_window is
@@ -4736,6 +4833,7 @@ int main() {
     TestB7B1EmptyDsackIgnored();
     TestB7B2ReversedBlockDoesNotPoisonGate();
     TestDsackDoesNotUndoWithoutMarker();
+    TestDsackOfOutOfOrderRecognized();
     TestB7B3OversizedDsackRejected();
     TestB7B4DsackGateUsesPacketDomain();
     xtcp::cc::KccTestResetRandom();
