@@ -2945,6 +2945,37 @@ namespace xtcp {
                         dsack_dups_ += dup_segs;
                         if (dsack_dups_ <= total_retrans_pkts_) {
                             sack_new_pkts += dup_segs;
+                            // Kernel tcp_check_dsack (tcp_input_66.c:1296-1301):
+                            //   if (tp->undo_marker && tp->undo_retrans > 0 &&
+                            //       !after(end_seq_0, prior_snd_una) &&
+                            //       after(end_seq_0, tp->undo_marker))
+                            //       tp->undo_retrans =
+                            //           max_t(int, 0, tp->undo_retrans - dup_segs);
+                            //
+                            // A D-SACK the peer ACCEPTED (all of tcp_dsack_seen's
+                            // credibility gates passed - that is the enclosing
+                            // branch) proves `dup_segs` of our retransmissions
+                            // were spurious, so they stop counting as
+                            // outstanding and stop blocking tcp_may_undo. The
+                            // port only ever INCREMENTED undo_retrans_, so after
+                            // the first retransmission the counter never came
+                            // back down and the legitimate undo was shut out
+                            // for the rest of the connection (audit D16).
+                            //
+                            // `!after(end_seq_0, prior_snd_una)`: the duplicate
+                            // must sit at/below the pre-ACK cumulative frontier.
+                            // `after(end_seq_0, undo_marker)`: it must be data
+                            // sent inside the episode being undone - the port's
+                            // undo_marker_ is a bool (the kernel's is a
+                            // sequence), so the episode's own anchor is
+                            // high_seq_; every accepted D-SACK overlaps a
+                            // retransmission inside the current episode by
+                            // construction (dsack_overlap below), so the
+                            // sequence compare reduces to that check.
+                            if (undo_marker_ && 0 < undo_retrans_) {
+                                undo_retrans_ = (undo_retrans_ > static_cast<Int32>(dup_segs))
+                                    ? undo_retrans_ - static_cast<Int32>(dup_segs) : 0;
+                            }
                         }
                     }
                 }
@@ -3119,7 +3150,30 @@ namespace xtcp {
                         }
                     }
                 }
-                if (dsack_overlap && !rto_pending_) {
+                // Kernel tcp_try_undo_dsack (tcp_input_66.c:2580-2592):
+                //
+                //     if (tp->undo_marker && !tp->undo_retrans) {
+                //         ...
+                //         tcp_undo_cwnd_reduction(sk, false);
+                //         return true;
+                //     }
+                //     return false;
+                //
+                // The undo_marker gate is what makes an episode with a CONFIRMED
+                // loss un-undoable. Ports set undo_marker_ false at every
+                // confirmation point: an RTO (:1825), a SACK block inside a
+                // no-SACK entry (:4035, the peer proved a real gap), an ECE
+                // (:3174, congestion is proven) and the undo itself (:3133).
+                // Without the gate a duplicate that merely happens to overlap a
+                // retransmitted range restores the pre-cut window even after
+                // the loss was confirmed - the connection re-inflates and
+                // overshoots (audit D16).
+                //
+                // undo_retrans_ mirrors tp->undo_retrans; <= 0 means no
+                // retransmission is still outstanding, so no D-SACK can
+                // still turn out to be spurious (same helper the recovery
+                // exit uses, see TcpMayUndo).
+                if (undo_marker_ && undo_retrans_ <= 0 && dsack_overlap && !rto_pending_) {
                     // Gate: a D-SACK must not undo while an RTO
                     // is pending - the RTO's own window cut is Eifel's to
                     // adjudicate (ts_ecr vs rto_ts_val_ below). Unconditionally

@@ -4491,6 +4491,75 @@ namespace {
     }
 
     /**
+     * @brief A D-SACK must not undo an episode that has no undo candidate.
+     *
+     * Kernel tcp_try_undo_dsack (tcp_input_66.c:2580-2592):
+     *
+     *     if (tp->undo_marker && !tp->undo_retrans) {
+     *         ...
+     *         tcp_undo_cwnd_reduction(sk, false);
+     *         return true;
+     *     }
+     *     return false;
+     *
+     * The undo_marker gate is what makes an ECE-marked episode
+     * un-undoable: tcp_fastretrans_alert part A clears the candidate when
+     * congestion is PROVEN (tcp_input_66.c:2986-2987, mirrored by the port's
+     * `prior_ssthresh_ = 0; undo_marker_ = false;` at tcp_fsm.cpp:3172-3175).
+     * Without the gate a duplicate that happens to overlap a retransmitted
+     * range restores the pre-cut window even though ECN proved the cut was
+     * justified - the connection then re-inflates and overshoots.
+     */
+    void TestDsackDoesNotUndoWithoutMarker() {
+        FsmHarness h;
+        h.conn.SetSackOk(true);
+        h.Warm();
+        h.conn.SetSndBuf(4u << 20);
+        for (UInt32 i = 0; i < 8; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        // Let the flight age, then SACK everything except the head: the pipe
+        // is 1 segment, and the recovery cut will land below the saved
+        // prior_cwnd_ so a wrongly-fired undo would be visible.
+        h.now += 20000;
+        h.Deliver(una, xtcp::core::kFlagAck, 65535, true,
+                  una + kMss, una + 8 * kMss);
+        // Enter recovery WITHOUT SACK: the entry saves prior_cwnd_ and keeps
+        // the undo candidate (tcp_fsm.cpp:3961 gates on opt->sack_count).
+        for (UInt32 i = 0; i < 3; ++i) {
+            h.now += 1000;
+            h.Deliver(una);
+        }
+        CHECK(h.conn.FastRecovery());
+        const UInt32 cwnd_cut = h.conn.Cwnd();
+        // A SACK block then arrives during the no-SACK entry: the loss is
+        // confirmed after all, so the port clears the undo candidate
+        // (tcp_fsm.cpp:4035, mirroring the kernel's proof that removes the
+        // spurious-loss hypothesis).
+        h.now += 1000;
+        h.Deliver(una, xtcp::core::kFlagAck, 65535, true,
+                  una + 6 * kMss, una + 7 * kMss);
+        const UInt32 cwnd_sack = h.conn.Cwnd();
+        const UInt32 ssth_sack = h.conn.Ssthresh();
+        // A D-SACK for the retransmitted head arrives: the cumulative ACK has
+        // moved past it (ack == una + kMss) and the block sits entirely below
+        // that frontier, which is the shape tcp_dsack_seen accepts. Kernel
+        // tcp_try_undo_dsack requires tp->undo_marker, which is now clear, so
+        // it must refuse and leave the reduction in place.
+        h.now += 1000;
+        h.Deliver(una + kMss, xtcp::core::kFlagAck, 65535, true, una, una + kMss);
+        std::fprintf(stderr,
+                     "[dsack-nomarker] cut cwnd=%u -> after SACK cwnd=%u ssth=%u "
+                     "-> after D-SACK cwnd=%u ssth=%u fr=%d\n",
+                     cwnd_cut, cwnd_sack, ssth_sack, h.conn.Cwnd(),
+                     h.conn.Ssthresh(), h.conn.FastRecovery() ? 1 : 0);
+        // No undo candidate: the reduction stands untouched.
+        CHECK(cwnd_sack == h.conn.Cwnd());
+        CHECK(ssth_sack == h.conn.Ssthresh());
+    }
+
+    /**
      * @brief B3: a DSACK block longer than tp->max_window is dubious and
      *        must be rejected (tcp_input_66.c:1015-1017). tp->max_window is
      *        the largest receive window the peer ever advertised
@@ -4666,6 +4735,7 @@ int main() {
     TestB7A4SackClearsLostOut();
     TestB7B1EmptyDsackIgnored();
     TestB7B2ReversedBlockDoesNotPoisonGate();
+    TestDsackDoesNotUndoWithoutMarker();
     TestB7B3OversizedDsackRejected();
     TestB7B4DsackGateUsesPacketDomain();
     xtcp::cc::KccTestResetRandom();
