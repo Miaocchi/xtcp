@@ -2983,6 +2983,55 @@ namespace {
     }
 
     /**
+     * @brief RACK must mark EVERY overdue segment lost, not just the first.
+     *
+     * Kernel tcp_rack_detect_loss (tcp_recovery_66.c:53-88) walks the whole
+     * tsorted_sent_queue and marks each overdue skb, WITHOUT breaking out of
+     * the loop:
+     *
+     *     list_for_each_entry_safe(skb, n, &tp->tsorted_sent_queue, ...) {
+     *         ...
+     *         if (!tcp_skb_sent_after(tp->rack.mstamp, ...))
+     *             break;
+     *         remaining = tcp_rack_skb_timeout(tp, skb, reo_wnd);
+     *         if (remaining <= 0) {
+     *             tcp_mark_skb_lost(sk, skb);
+     *             list_del_init(&skb->tcp_tsorted_anchor);
+     *         } else {
+     *             *reo_timeout = max_t(u32, *reo_timeout, remaining);
+     *         }
+     *     }
+     *
+     * The `break` there is the ordering cutoff (segments sent AFTER the RACK
+     * anchor are not judged); a segment that IS overdue does not stop the
+     * scan. Stopping at the first verdict leaves the rest of the overdue
+     * flight inside packets_out, so tcp_packets_in_flight() over-reports and
+     * the recovery entry computes its window from an inflated pipe.
+     */
+    void TestRackMarksAllOverdueLost() {
+        FsmHarness h;
+        h.conn.SetSackOk(true);
+        h.conn.SetSndBuf(4u << 20);
+        for (UInt32 i = 0; i < 5; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        // Let every segment age well past the reorder window.
+        h.now += 200000;
+        // SACK only the LAST segment: the RACK anchor lands on it, and the
+        // four before it are all overdue.
+        h.Deliver(una, xtcp::core::kFlagAck, 65535, true,
+                  una + 4 * kMss, una + 5 * kMss);
+        std::fprintf(stderr,
+                     "[rack-all] lost_out=%u retrans_out=%u fr=%d\n",
+                     h.conn.LostOutPkts(), h.conn.RetransOutPkts(),
+                     h.conn.FastRecovery() ? 1 : 0);
+        // Four segments are overdue: the kernel marks all four lost.
+        CHECK(4 == h.conn.LostOutPkts());
+        CHECK(h.conn.PipeInFlightBytesPublic() == h.conn.PipeWalkReference());
+    }
+
+    /**
      * @brief Batch 5 (D11) T5-3: the RTO snapshot survives a RACK verdict.
      *
      * T5-2 blocks the RACK entry outright; this test pins the OUTCOME the
@@ -4586,6 +4635,7 @@ int main() {
     TestRackDoesNotReenterLoss();
     TestRackDoesNotRecutInCwr();
     TestRackKeepsRtoSnapshot();
+    TestRackMarksAllOverdueLost();
     TestMigrationResetsKccRecoveryState();
     TestMigrationKeepsRetransTag();
     TestMigrationClearsOooBytes();

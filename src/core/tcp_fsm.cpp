@@ -2794,6 +2794,24 @@ namespace xtcp {
                 if (!SeqLt(seg.seq, rack_seq_)) {
                     break;  // at/after the RACK anchor: not lost
                 }
+                // Kernel tcp_rack_detect_loss (tcp_recovery_66.c:53-88) walks
+                // the WHOLE queue and marks every overdue skb - the loop's
+                // `break` is the ORDERING cutoff above, not a stop after the
+                // first verdict:
+                //
+                //     if (!tcp_skb_sent_after(tp->rack.mstamp, ...))
+                //         break;                    // sent after the anchor
+                //     remaining = tcp_rack_skb_timeout(tp, skb, reo_wnd);
+                //     if (remaining <= 0) {
+                //         tcp_mark_skb_lost(sk, skb);   // and keep scanning
+                //         list_del_init(&skb->tcp_tsorted_anchor);
+                //     }
+                //
+                // Marking only the first overdue segment leaves the rest of
+                // the overdue flight inside packets_out, so
+                // tcp_packets_in_flight() over-reports the pipe and the
+                // recovery entry derives its window from an inflated flight
+                // (audit D15).
                 if (rack_time_ > seg.sent_at && rack_time_ - seg.sent_at > rack_reo_wnd_) {
                     lost = true;
                     // Kernel RACK loss marking (tcp_input.c tcp_mark_skb_lost
@@ -2805,7 +2823,6 @@ namespace xtcp {
                         // LOST takes the segment out of the pipe.
                         PipeReaccountSeg(seg, seg.sacked, 0, seg.is_retrans);
                     }
-                    break;
                 }
             }
             if (!lost) {
