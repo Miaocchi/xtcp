@@ -1925,9 +1925,9 @@ namespace xtcp {
             // cwnd = packets_in_flight + 1 is applied unconditionally by
             // tcp_enter_loss, so the window still collapses.
             const bool reduce_this_loss =
-                (4 != cc_.ca_state) ||
+                (0 == cc_.ca_state) ||
                 !SeqLt(snd_una_, high_seq_) ||
-                (0 == icsk_retransmits_);
+                (4 == cc_.ca_state && 0 == icsk_retransmits_);
             if (reduce_this_loss) {
                 CutCwnd();
             } else {

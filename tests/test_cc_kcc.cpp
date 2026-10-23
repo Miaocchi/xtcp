@@ -2492,6 +2492,34 @@ namespace {
     }
 
     /**
+     * @brief Kernel tcp_enter_loss (tcp_input_66.c:2165-2173) re-cuts
+     *        ssthresh only when state <= TCP_CA_Disorder, snd_una >=
+     *        high_seq, or (state == Loss && !retransmits). An RTO that
+     *        fires while the connection is already in CA_Recovery must NOT
+     *        cut again - a reduction was already made in this window. The
+     *        port's guard was `(4 != ca_state)` (any state but Loss), which
+     *        re-cut during CWR/Recovery (audit D20).
+     */
+    void TestRtoInRecoveryDoesNotRecut() {
+        FsmHarness h;
+        h.conn.SetSackOk(true);
+        h.conn.SetSndBuf(4u << 20);
+        for (UInt32 i = 0; i < 4; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        for (UInt32 i = 0; i < 3; ++i) {
+            h.now += 1000;
+            h.Deliver(una);   // dup-ACKs -> CA_Recovery
+        }
+        CHECK(h.conn.FastRecovery());
+        const UInt32 ssth_rec = h.conn.Ssthresh();
+        h.now += 3000000;
+        h.conn.OnRetransmitTimer(h.now);   // RTO during Recovery
+        CHECK(ssth_rec == h.conn.Ssthresh());   // red: halved before the fix
+    }
+
+    /**
      * @brief A no-SACK partial ACK must retransmit the next hole.
      *
      * Kernel tcp_identify_packet_loss (tcp_input_66.c:2941-2956) dispatches
@@ -4876,6 +4904,7 @@ int main() {
     TestKccFsmCaStateReturnsToOpen();
     TestNonSackRecoveryHoldsAtHighSeq();
     TestNonSackLossHoldsAtHighSeq();
+    TestRtoInRecoveryDoesNotRecut();
     TestNonSackPartialAckRetransmitsNextHole();
     TestKccRecoveryExitKeepsPriorCwnd();
     TestKccRecoveryExitKeepsCcWindow();
