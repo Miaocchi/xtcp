@@ -248,6 +248,40 @@ reference instead of copying bytes. Spurious-retransmission detection runs
 on two independent signals (D-SACK feedback and the Eifel timestamp
 check); either can trigger cwnd restoration.
 
+### 8.1 RTO entry: two bases and a repeated-timeout guard
+
+`tcp_enter_loss` (Linux v6.6 `tcp_input_66.c:2154-2178`) computes the
+reduction from **two different bases**, and the port follows it exactly:
+
+```
+ssthresh = icsk_ca_ops->ssthresh(sk)     // Reno: max(cwnd >> 1, 2)
+cwnd     = tcp_packets_in_flight(tp) + 1
+```
+
+The threshold follows the **window**; the window follows the live **pipe**.
+Using the pipe for both halves an already-reduced number whenever the RTO has
+marked the head LOST before the cut (the head is marked first, so the pipe
+already excludes it).
+
+The reduction is also **guarded**:
+
+```
+if (state <= Disorder || !after(high_seq, snd_una) ||
+    (state == Loss && !icsk_retransmits)) { ...recompute ssthresh/prior_*... }
+cwnd = tcp_packets_in_flight(tp) + 1;    // unconditional
+```
+
+so a second timeout inside the **same** loss window keeps the first cut - and,
+critically, keeps the first `prior_ssthresh`/`prior_cwnd` snapshot, which the
+spurious-RTO undo later restores. `icsk_retransmits` counts consecutive RTOs
+and is cleared by a cumulative ACK that advances `snd_una` (kernel
+`tcp_clear_retrans`) and by a successful loss undo (`tcp_try_undo_loss`).
+
+`tcp_packets_in_flight()` is `packets_out - (sacked_out + lost_out) +
+retrans_out` (`tcp_66.h:1198-1220`). The port keeps those three sums
+incrementally so the query is O(1) - see `PERFORMANCE.md` §7 for the cost of
+the naive walk at a 100 Gbps BDP and the tests that pin the invariant.
+
 ## 9. Congestion-control plugins
 
 CC algorithms plug in through an operations table shaped like the Linux

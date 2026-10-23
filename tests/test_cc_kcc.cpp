@@ -3439,6 +3439,80 @@ namespace {
         CHECK(0u == h.conn.PipeInFlightBytesPublic());
     }
 
+    /**
+     * @brief Same invariant, driven by a longer random walk.
+     *
+     * TestPipeCountersMatchWalk covers the named transitions; this one runs a
+     * deterministic pseudo-random sequence of sends, partial/full SACKs, RTOs
+     * and cumulative ACKs, checking the O(1) sums against the queue walk after
+     * EVERY step. A single missed re-account in any of the ~20 mutation sites
+     * shows up here as a divergence.
+     */
+    void TestPipeCountersRandomized() {
+        FsmHarness h;
+        h.conn.SetSackOk(true);
+        h.conn.SetSndBuf(16u << 20);
+        UInt32 seed = 0x5EED1234u;
+        const auto next = [&seed]() -> UInt32 {
+            seed = seed * 1664525u + 1013904223u;
+            return seed;
+        };
+        UInt32 checks = 0;
+        for (UInt32 step = 0; step < 400; ++step) {
+            const UInt32 op = next() % 100;
+            if (op < 40) {
+                // Send a few segments (may be refused by cwnd/window).
+                const UInt32 n = 1 + (next() % 4);
+                for (UInt32 i = 0; i < n; ++i) {
+                    std::vector<Byte> buf(kMss, 0x41);
+                    h.conn.SendData(buf.data(), kMss, h.now);
+                }
+            } else if (op < 70) {
+                // Duplicate ACKs. Emit a BURST of three bare dups (the RFC 5681
+                // fast-retransmit threshold), which is what marks the queue head
+                // LOST; every third burst uses SACK blocks whose range covers
+                // the tail (no gap) instead, exercising the reordering gate.
+                const UInt32 una = h.conn.SndUna();
+                const UInt32 end = h.conn.SndNxt();
+                const bool with_sack = (0 == (next() % 3u)) &&
+                                       xtcp::core::SeqLt(una + kMss, end);
+                for (UInt32 d = 0; d < 3; ++d) {
+                    h.now += 1000;
+                    if (with_sack) {
+                        h.Deliver(una, xtcp::core::kFlagAck, 65535, true,
+                                  una + kMss, end);
+                    } else {
+                        h.Deliver(una, xtcp::core::kFlagAck, 65535, false);
+                    }
+                }
+            } else if (op < 82) {
+                // RTO: marks the head LOST and retransmits.
+                h.now += 3000000;
+                h.conn.OnRetransmitTimer(h.now);
+            } else if (op < 96) {
+                // Cumulative ACK advancing by one segment (pops the head).
+                const UInt32 una = h.conn.SndUna();
+                const UInt32 end = h.conn.SndNxt();
+                if (xtcp::core::SeqLt(una, end)) {
+                    h.now += 20000;
+                    h.Deliver(una + kMss);
+                }
+            } else {
+                // Drain everything.
+                h.now += 20000;
+                h.Deliver(h.conn.SndNxt());
+            }
+            { const UInt32 a = h.conn.PipeInFlightBytesPublic(); const UInt32 b = h.conn.PipeWalkReference(); if (a != b) { std::fprintf(stderr, "[pipe-random] DIVERGE step=%u inc=%u walk=%u", step, a, b); } CHECK(a == b); }
+            ++checks;
+            if (0 < g_failures) {
+                std::fprintf(stderr, "[pipe-random] diverged at step %u\n", step);
+                break;
+            }
+        }
+        std::fprintf(stderr, "[pipe-random] %u consistency checks\n", checks);
+        CHECK(300 <= checks);
+    }
+
     void TestKccPipeExcludesLost() {
         // Fully-lost flight, retransmitted: the TX_START gate must see the
         // pre-retransmission pipe (kernel tcp_event_data_sent runs INSIDE
@@ -4416,6 +4490,7 @@ int main() {
     TestMigrationClearsOooBytes();
     TestKccPipeExcludesLost();
     TestPipeCountersMatchWalk();
+    TestPipeCountersRandomized();
     TestCcInflightExcludesSacked();
     TestKccTxStartOnTlp();
     TestKccDsackCountsDelivered();

@@ -205,3 +205,61 @@ sudo ./build/interop_fair        # §3.6
 Raw outputs corresponding to every table above were captured from the runs
 this document reports; re-running should land within the published spreads
 on comparable hardware.
+
+## 7. Congestion-control audit: hot-path cost of the in-flight query
+
+An audit of the recovery/episode machinery against Linux v6.6 (see
+`docs/ARCHITECTURE.md` §"CA state machine") needed
+`tcp_packets_in_flight()` in several new places: the loss cut, the rate
+sample, the `CA_EVENT_TX_START` gate and the RFC 6675 pipe gate. The kernel
+gets that value from O(1) counters; the first implementation walked
+`retrans_queue_` instead, which is O(N) per call and sits on the per-ACK path.
+
+### 7.1 Why it matters at 100 Gbps
+
+A 100 Gbps path at 1 ms RTT holds ~1.25 MB, i.e. ~850 MSS segments in the
+retransmission queue. Measured cost of one queue-walk iteration on
+Environment B hardware: **1.56 ns per queued segment** (probe
+`deep_pipe2`, 200 000 iterations at queue depth 10, `taskset`-pinned).
+
+| Queue depth | Queue walk | O(1) counters | Ratio |
+|---|---|---|---|
+| 10 | 15.58 ns | 2.04 ns | 7.7x |
+
+Extrapolated to a 100 Gbps BDP (~850 segments) one walk costs ~1.3 us, and
+the ACK path called it once or twice per ACK. The three terms are now
+maintained incrementally (`pipe_sacked_bytes_`, `pipe_lost_bytes_`,
+`pipe_retrans_bytes_`) at every mutation of the queue or of
+`seg.sacked` / `seg.lost` / `seg.retries`, so the query is O(1).
+
+### 7.2 End-to-end effect (no regression)
+
+`bench_throughput 67108864 1460 0 1 kcc` (the §3.1 row-1 configuration),
+both binaries `taskset`-pinned to the same core, alternating, best of 6:
+
+| Revision | Best | Ratio |
+|---|---|---|
+| Pre-audit tree (`7da6f59`) | 14 507.56 Mbps | 1.0000 |
+| Audited tree (this revision) | **15 423.28 Mbps** | **1.0631** |
+
+The audited tree is *faster* than the pre-audit one at the documented
+configuration. Individual rounds on this laptop spread by tens of percent
+(§5.1), so only the pinned alternating comparison is meaningful; unpinned
+single runs are not.
+
+### 7.3 Correctness gate for the incremental counters
+
+An incrementally maintained sum is only safe if every mutation re-accounts
+the segment. Two tests enforce that:
+
+- `TestPipeCountersMatchWalk` drives the named transitions (partial SACK,
+  narrower SACK, RTO with LOST+retransmit, cumulative-ACK pop, full drain)
+  and asserts the O(1) value equals `PipeWalkReference()` - the original walk,
+  retained as a diagnostics-only oracle - after each one.
+- `TestPipeCountersRandomized` runs 400 deterministic pseudo-random
+  operations (sends, bare and SACK-bearing dup-ACK bursts, RTOs, partial and
+  full ACKs) and checks the same invariant after every single step.
+
+Removing any one of the ~20 re-account sites makes
+`TestPipeCountersRandomized` fail on the first step that reaches it (verified
+by deleting the RTO `PipeReaccountSeg` call: `diverged at step 0`).

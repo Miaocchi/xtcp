@@ -227,6 +227,37 @@ flowchart TB
 重传队列存的是 `BufRef` 句柄，重传克隆引用而不拷贝字节。伪重传检测有两条
 独立信号（D-SACK 反馈与 Eifel 时间戳检查），任一都可触发 cwnd 还原。
 
+### 8.1 RTO 入口：两个基准与重复超时门
+
+`tcp_enter_loss`（Linux v6.6 `tcp_input_66.c:2154-2178`）的降窗用**两个不同
+基准**计算，端口严格照此实现：
+
+```
+ssthresh = icsk_ca_ops->ssthresh(sk)     // Reno: max(cwnd >> 1, 2)
+cwnd     = tcp_packets_in_flight(tp) + 1
+```
+
+阈值跟随**窗口**，窗口跟随实时**管道**。若两者都用管道，则在 RTO 已先把队头
+标记为 LOST 的情形下（队头先标记，管道已排除它），会把已经减半的数值再减半。
+
+降窗本身还有**条件门**：
+
+```
+if (state <= Disorder || !after(high_seq, snd_una) ||
+    (state == Loss && !icsk_retransmits)) { ...重算 ssthresh/prior_*... }
+cwnd = tcp_packets_in_flight(tp) + 1;    // 无条件
+```
+
+因此**同一**损失窗口内的第二次超时保留第一次的降窗结果——更关键的是保留第一次
+的 `prior_ssthresh`/`prior_cwnd` 快照，因为伪 RTO 撤销要还原的正是它。
+`icsk_retransmits` 统计连续 RTO 次数，由推进 `snd_una` 的累积 ACK（内核
+`tcp_clear_retrans`）与成功的损失撤销（`tcp_try_undo_loss`）清零。
+
+`tcp_packets_in_flight()` = `packets_out - (sacked_out + lost_out) +
+retrans_out`（`tcp_66.h:1198-1220`）。端口把这三个和改为增量维护，使查询为
+O(1)——朴素遍历在 100 Gbps BDP 下的代价与钉住该不变式的测试见
+`PERFORMANCE_CN.md` §7。
+
 ## 9. 拥塞控制插件
 
 CC 算法通过与 Linux 内核 `tcp_congestion_ops` 同形的操作表接入，移植工作

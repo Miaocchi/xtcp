@@ -3018,10 +3018,21 @@ namespace xtcp {
                     // DELIVERY time (RFC 8985: the time the RACK segment was
                     // delivered), so a lost segment's age is measured from
                     // its send time against the most recent delivery.
-                    for (const SentSeg& seg : retrans_queue_) {
-                        if (seg.seq + seg.len == delivered_end) {
+                    //
+                    // Walk from the TAIL: the delivered frontier is normally
+                    // the newest data, so this finds it in one or two steps
+                    // instead of scanning the whole (up to ~850 segment) queue
+                    // on every SACK-bearing ACK.
+                    for (auto it = retrans_queue_.rbegin();
+                         it != retrans_queue_.rend(); ++it) {
+                        if (it->seq + it->len == delivered_end) {
                             rack_seq_ = delivered_end;
                             rack_time_ = now;
+                            break;
+                        }
+                        // The queue is seq-ascending, so once a segment ends
+                        // before the frontier no earlier one can match either.
+                        if (SeqLt(it->seq + it->len, delivered_end)) {
                             break;
                         }
                     }
@@ -4091,21 +4102,20 @@ namespace xtcp {
         }
 
         UInt32 TcpConn::PipeBytes() const noexcept {
-            // RFC 6675 间: pipe = (HighData - HighACK) - SACKed + Retransmitted.
+            // RFC 6675 pipe = (HighData - HighACK) - SACKed + Retransmitted.
             // SACKed bytes sit in the receiver's buffer (not the network) and
             // retransmitted-but-unacked bytes occupy the pipe twice, so the
             // pipe is the true in-network occupancy - the cwnd (inflated to
             // ssthresh+3 during recovery) overcounts it and stalls new data.
-            UInt32 sacked = 0;
-            UInt32 retrans = 0;
-            for (const SentSeg& seg : retrans_queue_) {
-                sacked += seg.sacked;
-                if (0 < seg.retries) {
-                    retrans += seg.len - seg.sacked;  // retransmitted bytes still in flight
-                }
-            }
+            //
+            // O(1) via the same incremental sums PipeInFlightBytes uses. The
+            // only difference between the two is LOST: RFC 6675's pipe keeps
+            // counting lost-but-unretransmitted bytes, tcp_packets_in_flight
+            // does not.
             const UInt32 inflight = snd_nxt_ - snd_una_;
-            return (inflight > sacked) ? (inflight - sacked + retrans) : retrans;
+            return (inflight > pipe_sacked_bytes_)
+                ? (inflight - pipe_sacked_bytes_ + pipe_retrans_bytes_)
+                : pipe_retrans_bytes_;
         }
 
         bool TcpConn::SendData(const Byte* data, UInt32 len, TimePoint now) noexcept {

@@ -190,3 +190,54 @@ sudo ./build/interop_fair        # §3.6
 
 上文每张表对应的原始输出都来自本文所报告的运行；在相近硬件上重跑应落在
 已公布的波动范围内。
+
+## 7. 拥塞控制审计：在飞查询的热路径代价
+
+对照 Linux v6.6 审计恢复/拥塞 episode 机制时（见
+`docs/ARCHITECTURE_CN.md` 的「CA 状态机」一节），需要在多处读取
+`tcp_packets_in_flight()`：损失降窗、速率采样、`CA_EVENT_TX_START` 门、
+以及 RFC 6675 的 pipe 门。内核从 O(1) 计数器得到该值；最初实现改为遍历
+`retrans_queue_`，即每次调用 O(N)，而它位于每 ACK 的路径上。
+
+### 7.1 为什么 100 Gbps 下必须处理
+
+100 Gbps、1 ms RTT 的路径在飞约 1.25 MB，即约 850 个 MSS 段留在重传队列。
+在环境 B 硬件上实测一次队列遍历迭代的成本：**每段 1.56 ns**（探针
+`deep_pipe2`，队列深度 10 下迭代 200 000 次，`taskset` 绑核）。
+
+| 队列深度 | 队列遍历 | O(1) 计数器 | 倍数 |
+|---|---|---|---|
+| 10 | 15.58 ns | 2.04 ns | 7.7x |
+
+外推到 100 Gbps BDP（约 850 段），一次遍历约 1.3 μs，而 ACK 路径每个 ACK
+调用一至两次。三个量现已改为增量维护（`pipe_sacked_bytes_`、
+`pipe_lost_bytes_`、`pipe_retrans_bytes_`），在队列或
+`seg.sacked` / `seg.lost` / `seg.retries` 的每次变更处同步，查询因此为 O(1)。
+
+### 7.2 端到端结果（无性能回退）
+
+`bench_throughput 67108864 1460 0 1 kcc`（§3.1 第 1 行的配置），两个二进制
+都 `taskset` 绑到同一核心、交替运行、取 6 轮最优：
+
+| 版本 | 最优 | 比值 |
+|---|---|---|
+| 审计前（`7da6f59`） | 14 507.56 Mbps | 1.0000 |
+| 审计后（本版本） | **15 423.28 Mbps** | **1.0631** |
+
+在文档所用配置下，审计后的版本比审计前**更快**。本机单轮波动可达数十个百分点
+（§5.1），因此只有绑核交替对比才有意义；未绑核的单次运行不作数。
+
+### 7.3 增量计数器的正确性门
+
+增量维护的求和只有在每次变更都重新记账时才安全。两个测试对此把关：
+
+- `TestPipeCountersMatchWalk` 驱动具名状态迁移（部分 SACK、收窄 SACK、
+  RTO 的 LOST+重传、累积 ACK 出队、全排空），每一步后断言 O(1) 值等于
+  `PipeWalkReference()`——保留为「仅诊断用」oracle 的原始遍历。
+- `TestPipeCountersRandomized` 执行 400 步确定性伪随机操作（发送、裸
+  dup-ACK 与带 SACK 的 dup-ACK 突发、RTO、部分与完整 ACK），每一步后校验
+  同一不变式。
+
+删除约 20 处记账点中的任意一处，`TestPipeCountersRandomized` 会在到达它的
+第一步即失败（已通过删除 RTO 的 `PipeReaccountSeg` 调用验证：
+`diverged at step 0`）。
