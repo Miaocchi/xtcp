@@ -2456,6 +2456,58 @@ namespace {
     }
 
     /**
+     * @brief A no-SACK partial ACK must retransmit the next hole.
+     *
+     * Kernel tcp_identify_packet_loss (tcp_input_66.c:2941-2956) dispatches
+     * the NewReno arm for a non-SACK connection:
+     *
+     *     if (unlikely(tcp_is_reno(tp)))
+     *         tcp_newreno_mark_lost(sk, *ack_flag & FLAG_SND_UNA_ADVANCED);
+     *
+     * and tcp_newreno_mark_lost (tcp_recovery_66.c:217-236) marks the
+     * retransmit-queue head LOST when
+     *
+     *     (state < TCP_CA_Recovery && sacked_out >= reordering) ||
+     *     (state == TCP_CA_Recovery && snd_una_advanced)
+     *
+     * - i.e. a cumulative ACK that advances snd_una during recovery marks
+     * the NEXT hole lost. tcp_xmit_recovery then retransmits it. That is the
+     * whole point of NewReno (RFC 6582 s3.2): each partial ACK repairs one
+     * hole, so recovery advances one segment per round trip instead of
+     * waiting for the RTO.
+     *
+     * The port dropped the retransmit for the no-SACK partial-ACK path (it
+     * only deflated cwnd), so recovery stalled until the RTO fired.
+     */
+    void TestNonSackPartialAckRetransmitsNextHole() {
+        FsmHarness h;
+        h.conn.SetSackOk(false);   // kernel tcp_is_reno(tp)
+        h.conn.SetSndBuf(4u << 20);
+        for (UInt32 i = 0; i < 6; ++i) {
+            h.Send(kMss);
+        }
+        const UInt32 una = h.conn.SndUna();
+        const UInt32 end = h.conn.SndNxt();
+        // Enter recovery with 3 raw dup-ACKs (no SACK blocks).
+        for (UInt32 i = 0; i < 3; ++i) {
+            h.now += 1000;
+            h.Deliver(una);
+        }
+        CHECK(h.conn.FastRecovery());
+        const UInt32 retx_entry = h.conn.RetransmitCount();
+        CHECK(1 == retx_entry);   // the entry retransmitted the head
+        // A partial ACK: advances snd_una by exactly one MSS, still below
+        // high_seq, so the episode stays open.
+        h.now += 20000;
+        h.Deliver(una + kMss);
+        // Kernel: tcp_newreno_mark_lost marks the next hole and
+        // tcp_xmit_recovery retransmits it.
+        CHECK(retx_entry + 1 == h.conn.RetransmitCount());
+        CHECK(h.conn.FastRecovery());
+        CHECK(xtcp::core::SeqLt(h.conn.SndUna(), end));
+    }
+
+    /**
      * @brief A Reno-path probe recording undo_cwnd calls and COMPLETE_CWR
      *        events (kernel tcp_undo_cwnd_reduction / tcp_ca_event).
      */
@@ -4787,6 +4839,7 @@ int main() {
     TestKccFsmCwndStaysLegal();
     TestKccFsmCaStateReturnsToOpen();
     TestNonSackRecoveryHoldsAtHighSeq();
+    TestNonSackPartialAckRetransmitsNextHole();
     TestKccRecoveryExitKeepsPriorCwnd();
     TestKccRecoveryExitKeepsCcWindow();
     TestExitAckDoesNotBurst();

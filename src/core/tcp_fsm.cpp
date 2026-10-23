@@ -1529,16 +1529,29 @@ namespace xtcp {
                     undo_retrans_ = 0;
                 }
                 undo_retrans_ += static_cast<Int32>(seg.pkt_count);
+                // D20: compute the re-arm deadline BEFORE the emit. sink_ can
+                // re-enter this connection (Tx -> peer -> OnSegment ->
+                // OnAckReceived -> RetransmitFront, recursive syncobj_) and
+                // the nested call may pop_front retrans_queue_, which frees the
+                // `seg` reference. Reading seg.rto after the emit was a
+                // heap-use-after-free (ASan: test_tx_backpressure,
+                // tcp_fsm.cpp:1541).
+                const UInt32 rearm_rto = (0 == seg.rto) ? rto_ : seg.rto;
                 // Emit LAST: the nested reentry must observe a consistent
                 // (already-updated) retransmit state.
                 sink_(std::move(copy));
+                // Re-arm: after a successful send use the (backed-off) seg.rto;
+                // on a failed rebuild (pool exhaustion, empty copy) re-arm at
+                // the current seg.rto so the next RTO round retries once the
+                // pool frees - the budget is untouched.
+                rto_deadline_ = now + rearm_rto;
+                timers_dirty_.store(true, std::memory_order_relaxed);
+            } else {
+                // Nothing left the wire (rebuild failed): `seg` is still alive,
+                // so the re-arm may read it directly.
+                rto_deadline_ = now + ((0 == seg.rto) ? rto_ : seg.rto);
+                timers_dirty_.store(true, std::memory_order_relaxed);
             }
-            // Re-arm: after a successful send use the (backed-off) seg.rto; on
-            // a failed rebuild (pool exhaustion, empty copy) re-arm at the
-            // current seg.rto so the next RTO round retries once the pool
-            // frees - the budget is untouched.
-            rto_deadline_ = now + ((0 == seg.rto) ? rto_ : seg.rto);
-            timers_dirty_.store(true, std::memory_order_relaxed);
         }
 
         void TcpConn::ResplitRetransQueue(UInt16 new_mss) noexcept {
@@ -3906,6 +3919,26 @@ namespace xtcp {
                         if (SeqLt(static_cast<UInt32>(cursor), snd_nxt_)) {
                             gaps_remain = true;
                         }
+                    } else {
+                        // Kernel tcp_fastretrans_alert part D (tcp_input_66.c:
+                        // 2995-3001): the state-exit test is ONLY
+                        //
+                        //     } else if (!before(tp->snd_una, tp->high_seq)) {
+                        //
+                        // i.e. the episode ends when the cumulative ACK
+                        // reaches high_seq, and NOT on a partial ACK. A
+                        // partial ACK (snd_una < high_seq) therefore stays in
+                        // CA_Recovery and falls through to part E, where the
+                        // NewReno arm (tcp_identify_packet_loss ->
+                        // tcp_newreno_mark_lost) marks and retransmits the
+                        // next hole (RFC 6582 s3.2).
+                        //
+                        // The port computed gaps_remain only from SACK blocks,
+                        // so a no-SACK partial ACK looked like "no gaps" and
+                        // took the exit branch - closing the recovery on the
+                        // first partial ACK and stranding the rest of the
+                        // burst behind the RTO (audit D18).
+                        gaps_remain = SeqLt(ack, high_seq_);
                     }
                     if (!gaps_remain) {
                         // Kernel tcp_is_non_sack_preventing_reopen
@@ -3985,28 +4018,85 @@ namespace xtcp {
                         if (SeqLt(sack_retx_next_, ack)) {
                             sack_retx_next_ = ack;
                         }
-                        // A partial ACK without SACK blocks carries no
-                        // confirmed-loss signal for the remaining tail (it is
-                        // merely in flight): retransmitting the front on every
-                        // cumulative-ACK advance duplicates live segments (a
-                        // per-ACK re-send storm). Deflate cwnd (Reno) and let
-                        // dupacks + the RTO backstop drive the retransmits.
+                        // A partial ACK without SACK blocks marks the new queue
+                        // head lost and retransmits it (NewReno, audit D18),
+                        // while STILL deflating cwnd to ssthresh on this ACK:
                         //
-                        // [retained deviation] This deflation has no direct
+                        // [retained deviation] The deflation has no direct
                         // kernel counterpart: the kernel leaves cwnd to
                         // tcp_cwnd_reduction (PRR) for the whole recovery. The
                         // port keeps it because the Reno no-SACK path has no
                         // SACK scoreboard to drive PRR's delivered/out balance;
                         // removing it re-introduces the per-ACK retransmit
-                        // storm documented above. Only the classic (non-plugin)
-                        // path reaches here - a plugin CC with cong_control
-                        // never enters this block (guard above).
+                        // storm. Only the classic (non-plugin) path reaches
+                        // here - a plugin CC with cong_control never enters
+                        // this block (guard above).
                         if (NULLPTR == opts || 0 == opts->sack_count) {
+                            // Kernel tcp_identify_packet_loss (tcp_input_66.c:
+                            // 2941-2956) dispatches the NewReno arm for a
+                            // non-SACK connection:
+                            //
+                            //     if (unlikely(tcp_is_reno(tp)))
+                            //         tcp_newreno_mark_lost(sk,
+                            //             *ack_flag & FLAG_SND_UNA_ADVANCED);
+                            //
+                            // tcp_newreno_mark_lost (tcp_recovery_66.c:217-236)
+                            // marks the retransmit-queue HEAD lost when
+                            //   (state < Recovery && sacked_out >= reordering) ||
+                            //   (state == Recovery && snd_una_advanced)
+                            // and tcp_xmit_recovery retransmits it. That IS
+                            // NewReno (RFC 6582 s3.2): every partial ACK
+                            // repairs one hole, so recovery advances one
+                            // segment per round trip. The port only deflated
+                            // cwnd here, so the hole waited for the RTO
+                            // (audit D18).
                             cc_.snd_cwnd = cc_.snd_ssthresh;
+                            if (!retrans_queue_.empty()) {
+                                SentSeg& head = retrans_queue_.front();
+                                if (head.sacked < head.len && 0 == head.lost) {
+                                    head.lost = 1;
+                                    lost_out_pkts_ += head.pkt_count;
+                                    PipeReaccountSeg(head, head.sacked, 0, head.is_retrans);
+                                }
+                            }
+                            RetransmitFront(now);
                         } else {
                             RetransmitEarliestMissing(now, opts);
                         }
                     }
+                }
+                // Kernel tcp_identify_packet_loss (tcp_input_66.c:2941-2956)
+                // runs from tcp_fastretrans_alert part E, i.e. OUTSIDE the
+                // cong_control early-return that guards tcp_cong_control
+                // (:3513-3531). It is LOSS DETECTION, not window management,
+                // so it applies to every CC:
+                //
+                //     if (unlikely(tcp_is_reno(tp)))
+                //         tcp_newreno_mark_lost(sk,
+                //             *ack_flag & FLAG_SND_UNA_ADVANCED);
+                //
+                // tcp_newreno_mark_lost (tcp_recovery_66.c:217-236) marks the
+                // retransmit-queue HEAD lost when the state is Recovery and
+                // snd_una advanced; tcp_xmit_recovery then retransmits it.
+                // That is NewReno (RFC 6582 s3.2): each partial ACK repairs
+                // one hole, so recovery advances one segment per round trip.
+                //
+                // The port had this inside the cong_control-guarded PRR block,
+                // so a no-SACK recovery driven by a plugin CC never marked or
+                // retransmitted the next hole - it waited for the RTO (audit
+                // D18). A plugin without an ssthresh hook takes the classic
+                // path above and is already covered there.
+                if (fast_recovery_ && !sack_ok_ && NULLPTR != cc_ops_ &&
+                    NULLPTR != cc_ops_->cong_control) {
+                    if (!retrans_queue_.empty()) {
+                        SentSeg& head = retrans_queue_.front();
+                        if (head.sacked < head.len && 0 == head.lost) {
+                            head.lost = 1;
+                            lost_out_pkts_ += head.pkt_count;
+                            PipeReaccountSeg(head, head.sacked, 0, head.is_retrans);
+                        }
+                    }
+                    RetransmitFront(now);
                 }
                 // Kernel send order (tcp_input.c:3938-3940):
                 //   tcp_rate_gen -> tcp_cong_control -> tcp_xmit_recovery
