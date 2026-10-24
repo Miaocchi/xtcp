@@ -9,9 +9,11 @@
 #include <xtcp/core/stack.h>
 #include <xtcp/ndi/manual.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 static int g_failures = 0;
 
@@ -25,7 +27,8 @@ static int g_failures = 0;
 
 static UInt32 g_drop_every = 0;
 static UInt32 g_drop_count = 0;
-static UInt32 g_tx_seen = 0;
+static UInt32 g_first_seen = 0;
+static UInt64 g_data_high = 0;   // highest (seq + payload) seen on the wire
 
 static void PumpLossy(xtcp::ndi::ManualBackend& a, xtcp::ndi::ManualBackend& b,
                       xtcp::XtcpStack& sa, xtcp::XtcpStack& sb) {
@@ -35,8 +38,49 @@ static void PumpLossy(xtcp::ndi::ManualBackend& a, xtcp::ndi::ManualBackend& b,
         while (0 != a.TxPending()) {
             const UInt32 n = a.PollTx(out);
             if (0 < n) {
-                ++g_tx_seen;
-                if (0 != g_drop_every && 0 == (g_tx_seen % g_drop_every)) {
+                bool drop = false;
+                if (0 != g_drop_every) {
+                    // Drop only FIRST-SEEN data, keyed by the data frontier.
+                    // Anything below g_data_high is a retransmission - whole
+                    // or PARTIAL (RetransmitEarliestMissing may resend from a
+                    // mid-segment offset, whose sequence number is not the
+                    // dropped segment's) - and must pass. Dropping a
+                    // retransmission let the Karn-polluted RTO back off past
+                    // the drain budget on slow hosts (the observed Debug
+                    // flake: ~30.6 s, received=259508 of 262144). The injected
+                    // loss stays 1-in-g_drop_every and recovery stays bounded.
+                    const UInt32 ip_hlen =
+                        n >= 20 ? static_cast<UInt32>(out[0] & 0x0fU) * 4U : 0;
+                    const UInt32 tcp_hlen =
+                        (ip_hlen >= 20 && n >= ip_hlen + 20)
+                            ? static_cast<UInt32>(out[ip_hlen + 12] >> 4U) * 4U : 0;
+                    const UInt32 ip_total =
+                        n >= 4 ? (static_cast<UInt32>(out[2]) << 8U) |
+                                     static_cast<UInt32>(out[3])
+                               : 0;
+                    const bool data = ip_hlen >= 20 && tcp_hlen >= 20 &&
+                                      ip_total > ip_hlen + tcp_hlen;
+                    if (data) {
+                        const UInt32 seq =
+                            (static_cast<UInt32>(out[ip_hlen + 4]) << 24) |
+                            (static_cast<UInt32>(out[ip_hlen + 5]) << 16) |
+                            (static_cast<UInt32>(out[ip_hlen + 6]) << 8) |
+                            static_cast<UInt32>(out[ip_hlen + 7]);
+                        const UInt64 seq_end =
+                            static_cast<UInt64>(seq) +
+                            static_cast<UInt64>(ip_total) -
+                            static_cast<UInt64>(ip_hlen) -
+                            static_cast<UInt64>(tcp_hlen);
+                        if (static_cast<UInt64>(seq) >= g_data_high) {
+                            g_data_high = seq_end;
+                            ++g_first_seen;
+                            if (0 == (g_first_seen % g_drop_every)) {
+                                drop = true;
+                            }
+                        }
+                    }
+                }
+                if (drop) {
                     ++g_drop_count;
                 } else {
                     b.Inject(out, n, 0x0800);
