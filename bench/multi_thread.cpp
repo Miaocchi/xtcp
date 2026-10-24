@@ -68,9 +68,22 @@ namespace {
 
 int main() {
     UInt32 segments = kSegments;
+#if defined(_MSC_VER)
+    // MSVC flags the plain getenv as deprecated (C4996); _dupenv_s is the
+    // documented replacement and keeps the Windows benchmark build
+    // warning-free.
+    char* env_value = NULLPTR;
+    size_t env_len = 0;
+    if (0 == ::_dupenv_s(&env_value, &env_len, "XTCP_BENCH_SEGS") &&
+        NULLPTR != env_value) {
+        segments = static_cast<UInt32>(std::strtoul(env_value, NULLPTR, 10));
+        std::free(env_value);
+    }
+#else
     if (const char* env = std::getenv("XTCP_BENCH_SEGS")) {
         segments = static_cast<UInt32>(std::strtoul(env, NULLPTR, 10));
     }
+#endif
 #ifdef _WIN32
     SetUnhandledExceptionFilter([](LPEXCEPTION_POINTERS ep) -> LONG {
         std::fprintf(stderr, "[crash] code=%08X address=%p\n",
