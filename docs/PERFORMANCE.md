@@ -35,11 +35,15 @@ Chinese version: [PERFORMANCE_CN.md](PERFORMANCE_CN.md).
 
 ### Environment C — QEMU emulation (functional verification only)
 
-aarch64 cross-build with GCC 13 (`aarch64-linux-gnu-g++`), fully static,
-executed under `qemu-aarch64` user-mode emulation on the same host. QEMU
-single-core emulation distorts wall-clock pacing, so **no performance
-numbers are taken from this environment**; it exists to prove the code is
-correct on ARM64 (237/237 tests pass there).
+aarch64 cross-build with GCC 13 (`aarch64-linux-gnu-g++`), dynamically
+linked against the aarch64 sysroot and executed under `qemu-aarch64`
+user-mode emulation (`qemu-aarch64 -L /usr/aarch64-linux-gnu`) on the same
+host. A fully static link is deliberately not used: the plugin loader calls
+`dlopen`, and a static link then warns that the glibc shared objects are
+still required at run time. QEMU single-core emulation distorts wall-clock
+pacing, so **no performance numbers are taken from this environment**; it
+exists to prove the code is correct on ARM64 (240/240 tests pass there,
+zero warnings).
 
 ## 2. What each benchmark measures
 
@@ -79,6 +83,12 @@ Reading these rows:
 - 64-byte writes are packet-rate bound: ~3.7 Mpps regardless of bandwidth,
   i.e. per-segment fixed cost dominates.
 
+**Measurement note.** The rows above were taken *unpinned* on an otherwise
+idle host. Thread migration alone moves the same binary by tens of percent,
+and the host cannot reproduce them while any sustained load is running.
+§7.7 repeats the comparison core-pinned against the pre-audit tree with
+five-run medians; use those numbers when comparing revisions.
+
 ### 3.2 RX worker scaling (`bench_multi_thread`, Environment A)
 
 Each worker injects 200 000 segments into its own flow; workers run
@@ -93,6 +103,12 @@ Eight workers aggregate *below* one worker. This is a measured property of
 the current implementation under synthetic injection, not a law: per-worker
 flows hash to different shards, so the run exercises cross-shard parallelism
 plus shared ingress paths. Treat multi-core claims accordingly (§5).
+
+**Correction (§7.7):** these numbers were measured *unpinned*, so the worker
+threads migrated across the 32 logical CPUs. Pinned to eight dedicated cores
+the eight-worker aggregate is 157-163 Gbps (above 100 Gbps) and the
+single-worker figure is 94-104 Gbps; the "eight below one" reading was a
+scheduling artefact, not the sharded ceiling.
 
 ### 3.3 Connection handling (`bench_syn_rate`, `bench_conns`, Environment A)
 
@@ -149,13 +165,15 @@ Jain index = 0.9999 ; all flows completed
 Performance means nothing if correctness is conditional, so the gates that
 held while these numbers were taken:
 
-- Full deterministic suite: every registered test passes on Windows MSVC
-  Release (`ctest`; 237/237 with the optional lwIP differential target,
-  236/236 without).
-- Same suite, aarch64 static cross-build: 237/237 under `qemu-aarch64`
-  (three sequential batches of 80/80/77, zero failures).
+- Full deterministic suite, four local configurations: Linux g++ Release
+  240/240, Linux clang++ Release 240/240, Linux g++ ASan/UBSan 240/240,
+  Linux clang++ ASan/UBSan 240/240; Windows MSVC Release 239/239 and MSVC
+  Debug 239/239.
+- aarch64 cross-build under `qemu-aarch64`: 240/240, zero warnings.
 - CI on the exact source revision: ASan+UBSan suites green on Linux
-  (clang++ and g++) and Windows MSVC.
+  (clang++ and g++) and Windows MSVC (Release and Debug).
+- Zero compiler warnings in every configuration, including the builds that
+  enable `samples/`, `bench/` and the lwIP differential target.
 
 ## 5. Threats to validity
 
@@ -202,11 +220,29 @@ sudo ./build/interop_perf        # §3.5
 sudo ./build/interop_fair        # §3.6
 ```
 
+Core-pinned runs (§7.7) - pinning is what makes cross-revision numbers
+comparable, because an unpinned run moves by tens of percent with scheduler
+migration:
+
+```bash
+# Linux
+taskset -c 3           ./build/bench_throughput 67108864 1460 0 1 kcc 0   # single core
+taskset -c 3           ./build/bench_throughput 268435456 1460 0 1 kcc 0  # 256 MB
+taskset -c 0-7         ./build/bench_multi_thread                         # eight cores
+```
+
+```powershell
+# Windows: set ProcessorAffinity after start (0x8 = core 3, 0xFF = cores 0-7)
+$p = Start-Process build\Release\bench_throughput.exe `
+     -ArgumentList '67108864','1460','0','1','kcc','0' -NoNewWindow -PassThru
+$p.ProcessorAffinity = [IntPtr]0x8; $p.WaitForExit()
+```
+
 Raw outputs corresponding to every table above were captured from the runs
 this document reports; re-running should land within the published spreads
 on comparable hardware.
 
-## 7. Congestion-control audit: hot-path cost of the in-flight query
+## 7. Hot-path cost: the in-flight query and the optimisation series
 
 An audit of the recovery/episode machinery against Linux v6.6 (see
 `docs/ARCHITECTURE.md` §"CA state machine") needed
@@ -214,6 +250,13 @@ An audit of the recovery/episode machinery against Linux v6.6 (see
 sample, the `CA_EVENT_TX_START` gate and the RFC 6675 pipe gate. The kernel
 gets that value from O(1) counters; the first implementation walked
 `retrans_queue_` instead, which is O(N) per call and sits on the per-ACK path.
+
+The hot path has been tightened further since that audit: §7.4-§7.6 record
+each step with its deterministic instruction-count effect, and §7.7 the
+core-pinned end-to-end result. Cumulative against the scalar baseline
+(`ca519b7`): 30 398 091 -> 24 730 947 instructions for the same 1 MiB
+workload (-18.6%), and +26% median throughput on the documented
+configuration.
 
 ### 7.1 Why it matters at 100 Gbps
 
@@ -246,6 +289,13 @@ The audited tree is *faster* than the pre-audit one at the documented
 configuration. Individual rounds on this laptop spread by tens of percent
 (§5.1), so only the pinned alternating comparison is meaningful; unpinned
 single runs are not.
+
+**Host-state caveat.** These two numbers and §3.1's 24.6 Gbps come from the
+same command measured in different host states: the pre-audit tree today
+measures anywhere from 14.5 to 21.8 Gbps depending on background load. The
+ratio above is therefore only valid within its own session. §7.7 is the
+reference comparison - pinned alternating A/B, five-run medians, current
+tree.
 
 ### 7.3 Correctness gate for the incremental counters
 
@@ -366,3 +416,45 @@ Correctness: `test_checksum_simd` (SIMD vs scalar differential) passes, the
 transfer tests' rolling-CRC checks pass, and the full matrix is green (WSL
 Release 240/240, WSL ASan 240/240, MSVC Release 239/239, MSVC Debug 239/239)
 with zero warnings on clean builds.
+
+### 7.7 Pinned-core measurements (single core vs eight cores)
+
+Every number below is core-pinned (`taskset -c` on Linux,
+`ProcessorAffinity` on Windows), five runs per configuration, median and
+best reported, measured in one session on the same host against the
+pre-audit tree (`7da6f59`) as the control. The host was **not** idle (the agent session itself held ~700% CPU) and
+ran on the Windows **Balanced** power plan, not the vendor profile recorded
+in §1 for the §3 numbers - two more reasons the absolute values sit below an
+idle-host run. Only the paired comparison is meaningful.
+
+Single core (core 3), full-stack loopback:
+
+| Config | `7da6f59` median | `7da6f59` best | this build median | this build best | median delta |
+|---|---|---|---|---|---|
+| Windows 64 MB / 1460 B | 15 431.77 | 19 671.74 | 21 434.21 | 23 041.09 | +38.9% |
+| Windows 256 MB / 1460 B | 16 809.32 | 21 266.21 | 20 969.03 | 23 178.04 | +24.7% |
+| WSL2 64 MB / 1460 B | 15 497.33 | 16 382.10 | 19 248.16 | 20 447.56 | +24.2% |
+| WSL2 256 MB / 1460 B | 16 026.39 | 16 725.19 | 16 603.70 | 20 047.44 | +3.6% |
+| WSL2 RX injection, 1 worker | 54.10 Gbps | 55.80 | 64.55 | 65.34 | +19.3% |
+
+Eight cores (cores 0-7), RX injection (`bench_multi_thread`, Windows host):
+
+| Metric | `7da6f59` | this build |
+|---|---|---|
+| 1 worker median | 89.79 Gbps | 94.30 Gbps |
+| 1 worker best | 90.45 Gbps | 104.41 Gbps |
+| 8 worker aggregate median | 154.21 Gbps | **157.12 Gbps** |
+| 8 worker aggregate best | 159.65 Gbps | **162.68 Gbps** |
+
+The 8-worker runs were 149.5-162.7 Gbps across five runs (all above 100 Gbps).
+
+Against the immediate pre-optimisation tree (`ca519b7`, the scalar
+copy+checksum build), the same 64 MB pinned configuration moved from a
+13 258.4 Mbps median to 16 740.0 Mbps (x1.263) over 12 alternating rounds -
+the "+26%" quoted in §7.
+
+Single-flow ceiling: a 1460 B flow at 23 Gbps carries ~1.6 M segments/s, i.e.
+~2700 cycles/segment on one core. A single-flow 100 Gbps would need 8.56 M
+segments/s (~520 cycles/segment), which is unreachable in-process without
+TSO/zero-copy/NIC offload. 100 Gbps is reached by sharding flows across cores:
+eight pinned cores give 157-163 Gbps.

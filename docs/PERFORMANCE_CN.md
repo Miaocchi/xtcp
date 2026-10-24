@@ -34,10 +34,12 @@
 
 ### 环境 C —— QEMU 仿真（仅用于功能验证）
 
-GCC 13（`aarch64-linux-gnu-g++`）aarch64 交叉构建、全静态链接，在同一
-主机上以 `qemu-aarch64` 用户态仿真执行。QEMU 单核仿真会扭曲墙钟节奏，
+GCC 13（`aarch64-linux-gnu-g++`）aarch64 交叉构建，动态链接 aarch64
+sysroot，并在同一主机上以 `qemu-aarch64 -L /usr/aarch64-linux-gnu`
+用户态仿真执行。刻意不使用全静态链接：插件加载器调用 `dlopen`，静态链接
+会报警提示运行时仍需同名 glibc 共享库。QEMU 单核仿真会扭曲墙钟节奏，
 因此**本环境不产生任何性能数字**；它的作用是证明代码在 ARM64 上正确
-（237/237 测试通过）。
+（240/240 测试通过，零警告）。
 
 ## 2. 每个基准测什么
 
@@ -76,6 +78,11 @@ GCC 13（`aarch64-linux-gnu-g++`）aarch64 交叉构建、全静态链接，在�
 - 64 字节写入受包速率限制：无论带宽多少约 3.7 Mpps，即每段固定成本
   占主导。
 
+**测量说明。** 上表是**未绑核**、主机空闲时测的。仅线程迁移一项就能让
+同一个二进制波动数十个百分点；主机上有持续负载时无法复现这些数字。
+§7.7 用绑核 + 五轮中位数，以审计前树为对照重做了比较；跨版本比较请以
+那一组为准。
+
 ### 3.2 RX worker 扩展性（`bench_multi_thread`，环境 A）
 
 每个 worker 向自己的流注入 200 000 段；worker 并发作用于同一个栈。
@@ -88,6 +95,10 @@ GCC 13（`aarch64-linux-gnu-g++`）aarch64 交叉构建、全静态链接，在�
 八个 worker 的聚合*低于*单 worker。这是当前实现在合成注入下的实测性质，
 不是定律：各 worker 的流哈希到不同分片，该运行同时锻炼跨分片并行与共享
 入口路径。引用多核结论时请据此措辞（§5）。
+
+**更正（§7.7）。** 上表是**未绑核**测量的，工作线程会在 32 个逻辑 CPU
+之间迁移。绑死 8 个核后，8 worker 聚合为 157–163 Gbps（超过 100 Gbps），
+单 worker 为 94–104 Gbps；“8 低于 1”是调度假象，不是分片上限。
 
 ### 3.3 连接处理（`bench_syn_rate`、`bench_conns`，环境 A）
 
@@ -142,12 +153,14 @@ Jain index = 0.9999 ; all flows completed
 
 正确性是有条件的时性能毫无意义，因此列出产生这些数字时成立的质量门：
 
-- 全量确定性套件：Windows MSVC Release 注册项全部通过（`ctest`；含可选
-  lwIP 差分目标 237/237，不含 236/236）。
-- 同一套件 aarch64 静态交叉构建：`qemu-aarch64` 下 237/237 通过
-  （80/80/77 三批顺序执行，零失败）。
+- 全量确定性套件，本地四套配置：Linux g++ Release 240/240、Linux clang++
+  Release 240/240、Linux g++ ASan/UBSan 240/240、Linux clang++
+  ASan/UBSan 240/240；Windows MSVC Release 239/239、MSVC Debug 239/239。
+- aarch64 交叉构建在 `qemu-aarch64` 下：240/240，零警告。
 - 精确源码版本的 CI：Linux（clang++ 与 g++）ASan+UBSan 与 Windows MSVC
-  全绿。
+  （Release 与 Debug）全绿。
+- 所有配置零编译警告，包括开启 `samples/`、`bench/` 与 lwIP 差分目标的
+  构建。
 
 ## 5. 有效性威胁
 
@@ -188,16 +201,38 @@ sudo ./build/interop_perf        # §3.5
 sudo ./build/interop_fair        # §3.6
 ```
 
+绑核运行（§7.7）——绑核是跨版本数字可比的前提，未绑核的单次运行会因调度迁移
+波动数十个百分点：
+
+```bash
+# Linux
+taskset -c 3           ./build/bench_throughput 67108864 1460 0 1 kcc 0   # 单核
+taskset -c 3           ./build/bench_throughput 268435456 1460 0 1 kcc 0  # 256 MB
+taskset -c 0-7         ./build/bench_multi_thread                         # 八核
+```
+
+```powershell
+# Windows：启动后设置 ProcessorAffinity（0x8 = core 3，0xFF = core 0-7）
+$p = Start-Process build\Release\bench_throughput.exe `
+     -ArgumentList '67108864','1460','0','1','kcc','0' -NoNewWindow -PassThru
+$p.ProcessorAffinity = [IntPtr]0x8; $p.WaitForExit()
+```
+
 上文每张表对应的原始输出都来自本文所报告的运行；在相近硬件上重跑应落在
 已公布的波动范围内。
 
-## 7. 拥塞控制审计：在飞查询的热路径代价
+## 7. 热路径代价：在飞查询与优化历程
 
 对照 Linux v6.6 审计恢复/拥塞 episode 机制时（见
 `docs/ARCHITECTURE_CN.md` 的「CA 状态机」一节），需要在多处读取
 `tcp_packets_in_flight()`：损失降窗、速率采样、`CA_EVENT_TX_START` 门、
 以及 RFC 6675 的 pipe 门。内核从 O(1) 计数器得到该值；最初实现改为遍历
 `retrans_queue_`，即每次调用 O(N)，而它位于每 ACK 的路径上。
+
+此后热路径继续收紧：§7.4–§7.6 逐步记录每一步及其确定性的指令数变化，
+§7.7 给出绑核的端到端结果。相对标量基线（`ca519b7`）累计：同一 1 MiB
+负载的指令数 30 398 091 -> 24 730 947（-18.6%），文档配置下吞吐中位数
++26%。
 
 ### 7.1 为什么 100 Gbps 下必须处理
 
@@ -226,6 +261,11 @@ sudo ./build/interop_fair        # §3.6
 
 在文档所用配置下，审计后的版本比审计前**更快**。本机单轮波动可达数十个百分点
 （§5.1），因此只有绑核交替对比才有意义；未绑核的单次运行不作数。
+
+**主机状态说明。** 上表两个数字与 §3.1 的 24.6 Gbps 是同一命令在不同主机
+状态下的测量：审计前树今天在 14.5–21.8 Gbps 之间浮动，取决于后台负载。
+因此上表的比值只在其自身会话内有效。§7.7 才是基准对照——绑核交替 A/B、
+五轮中位数、当前树。
 
 ### 7.3 增量计数器的正确性门
 
@@ -330,3 +370,41 @@ Windows 宿主（Environment A）同一命令最优 22 674 Mbps（5 次）。本
 正确性：`test_checksum_simd`（SIMD 与标量差分）通过，各传输测试的滚动 CRC 通过，
 全矩阵绿（WSL Release 240/240、WSL ASan 240/240、MSVC Release 239/239、
 MSVC Debug 239/239），干净构建零警告。
+
+### 7.7 绑核测量（单核 vs 八核）
+
+以下全部为绑核测量（Linux 用 `taskset -c`，Windows 用 `ProcessorAffinity`），
+每个配置 5 轮，给中位数与最优；同一会话、同一主机、以审计前树 `7da6f59`
+作为对照。测量时主机**并非空闲**（本会话自身占用约 700% CPU），且使用 Windows
+**平衡**电源计划，而非 §1 中为 §3 数字记录的厂商性能配置——这两点都使绝对值
+低于空闲态。只有成对比较才有效。
+
+单核（core 3），全栈 loopback：
+
+| 配置 | `7da6f59` 中位 | `7da6f59` 最优 | 本构建 中位 | 本构建 最优 | 中位变化 |
+|---|---|---|---|---|---|
+| Windows 64 MB / 1460 B | 15 431.77 | 19 671.74 | 21 434.21 | 23 041.09 | +38.9% |
+| Windows 256 MB / 1460 B | 16 809.32 | 21 266.21 | 20 969.03 | 23 178.04 | +24.7% |
+| WSL2 64 MB / 1460 B | 15 497.33 | 16 382.10 | 19 248.16 | 20 447.56 | +24.2% |
+| WSL2 256 MB / 1460 B | 16 026.39 | 16 725.19 | 16 603.70 | 20 047.44 | +3.6% |
+| WSL2 RX 注入，1 worker | 54.10 Gbps | 55.80 | 64.55 | 65.34 | +19.3% |
+
+八核（core 0-7），RX 注入（`bench_multi_thread`，Windows 宿主）：
+
+| 指标 | `7da6f59` | 本构建 |
+|---|---|---|
+| 1 worker 中位 | 89.79 Gbps | 94.30 Gbps |
+| 1 worker 最优 | 90.45 Gbps | 104.41 Gbps |
+| 8 worker 聚合 中位 | 154.21 Gbps | **157.12 Gbps** |
+| 8 worker 聚合 最优 | 159.65 Gbps | **162.68 Gbps** |
+
+8 worker 五轮区间 149.5–162.7 Gbps，全部超过 100 Gbps。
+
+对紧邻的优化前树（`ca519b7`，标量拷贝+校验和构建），同一 64 MB 绑核配置在
+12 轮交替中从 13 258.4 Mbps 中位数升到 16 740.0 Mbps（x1.263）——即 §7 引言
+中的“+26%”。
+
+单流上限：1460 B 流在 23 Gbps 时为约 1.6 M 段/s，即单核约 2700
+cycles/段。单流 100 Gbps 需要 8.56 M 段/s（约 520 cycles/段），在进程内
+没有 TSO/零拷贝/网卡卸载的情况下不可达。100 Gbps 依靠多核分片实现：
+绑 8 个核得到 157–163 Gbps。
