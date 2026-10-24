@@ -13,6 +13,24 @@
 #include <map>
 #include <unordered_map>
 
+/**
+ * @brief SSSE3 fast-path availability.
+ *
+ * The vectorized checksum and fused copy+checksum routines are compiled on
+ * every x86 compiler and selected at run time by CpuHasSsse3(). GCC and
+ * Clang need the ISA enabled for those functions only; the function-scoped
+ * `target` attribute supplies it, so the translation unit's global ISA
+ * baseline (and the portability of every other function) is unchanged.
+ */
+#if defined(XTCP_X86) && (defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__))
+#define XTCP_HAS_SSSE3_CODE 1
+#if defined(_MSC_VER)
+#define XTCP_TARGET_SSSE3
+#else
+#define XTCP_TARGET_SSSE3 __attribute__((target("ssse3")))
+#endif
+#endif
+
 namespace xtcp {
     namespace core {
         /**

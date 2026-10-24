@@ -241,3 +241,34 @@ sudo ./build/interop_fair        # §3.6
 删除约 20 处记账点中的任意一处，`TestPipeCountersRandomized` 会在到达它的
 第一步即失败（已通过删除 RTO 的 `PipeReaccountSeg` 调用验证：
 `diverged at step 0`）。
+
+
+### 7.4 GCC/Clang 上的 SSSE3 拷贝+校验和
+
+融合的「负载拷贝 + RFC 1071 累加」原本用 `__SSSE3__` / `_MSC_VER` 守卫。GCC 与
+Clang 在默认 `-march` 下不定义 `__SSSE3__`，所以 Linux 上整条向量路径被编译掉，
+每个数据段退回标量逐字节循环——callgrind 中它被折进 `BuildSegmentPacket`，占
+全部指令的 28.05%（`bench_throughput 1048576 1024 0 1 kcc 0`）。MSVC 因
+`_MSC_VER` 满足守卫不受影响，这正是同一份源码在 Windows 上比 WSL 快约 60% 的
+原因。
+
+守卫改为 `XTCP_HAS_SSSE3_CODE`，两个向量函数加函数级
+`__attribute__((target("ssse3")))`（`XTCP_TARGET_SSSE3`）。翻译单元的全局 ISA
+基线不变，运行时仍由 `CpuHasSsse3()` 选择，无 SSSE3 的 CPU 继续走标量回退。
+`Checksum()` 另把「头部尺寸」输入（< 64 B：IPv4 伪首部 12 B、IPv4 头 20 B、
+TCP 头 20 B）改走标量循环——该尺寸下向量建立/收尾比字加更贵。
+
+确定性收益（callgrind，同一 1 MiB 负载，指令数）：
+
+| 构建 | 总 Ir | 相对标量 |
+|---|---|---|
+| 标量（`ca519b7`） | 30 398 091 | 1.0000 |
+| 启用 SSSE3 | **26 204 645** | **0.8620** |
+
+`CopyAndChecksumSimd` 现为独立符号、占 10.46%（2.74 M Ir），不再折入
+`BuildSegmentPacket` 的 28.05%；`ChecksumSimd` 已完全离开热点表。绑核交替的
+墙钟数据落在 §5.1 的波动范围内，均值 +7%（8 轮，均值比值 1.0698）；指令数是
+无噪声的判据。
+
+正确性：`test_checksum_simd`（SIMD 与标量差分）通过，全矩阵绿（WSL Release
+240/240、WSL ASan 240/240、MSVC Release 239/239、MSVC Debug 239/239）。

@@ -72,8 +72,8 @@ namespace xtcp {
             return static_cast<UInt16>(~sum & 0xFFFF);
         }
 
-#if defined(XTCP_X86) && (defined(__SSSE3__) || defined(__SSSE3) || defined(_MSC_VER))
-        UInt16 ChecksumSimd(const void* data, UInt32 len) noexcept {
+#if defined(XTCP_HAS_SSSE3_CODE)
+        XTCP_TARGET_SSSE3 UInt16 ChecksumSimd(const void* data, UInt32 len) noexcept {
             // SSSE3 vectorized RFC 1071: pshufb reverses each 16-byte chunk
             // into 8 big-endian 16-bit words, zero-extended into 32-bit
             // accumulators (8 lanes). Addition is commutative/associative,
@@ -230,9 +230,15 @@ namespace xtcp {
         }
 
         UInt16 Checksum(const void* data, UInt32 len) noexcept {
-#if defined(XTCP_X86) && (defined(__SSSE3__) || defined(__SSSE3) || defined(_MSC_VER))
+#if defined(XTCP_HAS_SSSE3_CODE)
             if (CpuHasSsse3()) {
-                return ChecksumSimd(data, len);
+                // Header-sized inputs (IPv4 pseudo 12 B, IPv4 20 B, TCP 20 B)
+                // are dominated by the vector setup/drain; the scalar word
+                // loop is cheaper below the crossover. Both paths are
+                // bit-identical (addition is commutative), so the split is a
+                // pure cost choice.
+                return (64 > len) ? ChecksumScalar(data, len)
+                                  : ChecksumSimd(data, len);
             }
 #endif
             return ChecksumScalar(data, len);

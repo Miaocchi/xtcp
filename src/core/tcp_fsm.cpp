@@ -119,7 +119,7 @@ namespace xtcp {
 #endif
             }
 
-#if defined(XTCP_X86) && (defined(__SSSE3__) || defined(__SSSE3) || defined(_MSC_VER))
+#if defined(XTCP_HAS_SSSE3_CODE)
             /**
              * @brief Fused copy + RFC 1071 checksum (vectorized path, SSSE3).
              *        Bit-identical result to the scalar accumulation: the
@@ -128,7 +128,7 @@ namespace xtcp {
              *        chunks zero-extended into 32-bit lanes - addition is
              *        commutative, so the fold matches exactly).
              */
-            inline UInt16 CopyAndChecksumSimd(Byte* dst, const Byte* src, UInt32 len) noexcept {
+            XTCP_TARGET_SSSE3 inline UInt16 CopyAndChecksumSimd(Byte* dst, const Byte* src, UInt32 len) noexcept {
                 __m128i acc_lo = _mm_setzero_si128();
                 __m128i acc_hi = _mm_setzero_si128();
                 static const __m128i kRev16 = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
@@ -290,7 +290,7 @@ namespace xtcp {
              *        (signature connections read the payload once, not twice).
              */
             inline UInt16 CopyAndChecksum(Byte* dst, const Byte* src, UInt32 len, Md5Ctx* md5 = NULLPTR) noexcept {
-#if defined(XTCP_X86) && (defined(__SSSE3__) || defined(__SSSE3) || defined(_MSC_VER))
+#if defined(XTCP_HAS_SSSE3_CODE)
                 // MD5 interleaving is inherently scalar; the vectorized path
                 // serves the (common) unsigned fast path.
                 if (NULLPTR == md5 && CpuHasSsse3()) {

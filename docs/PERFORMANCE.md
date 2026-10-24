@@ -263,3 +263,40 @@ the segment. Two tests enforce that:
 Removing any one of the ~20 re-account sites makes
 `TestPipeCountersRandomized` fail on the first step that reaches it (verified
 by deleting the RTO `PipeReaccountSeg` call: `diverged at step 0`).
+
+
+### 7.4 SSSE3 copy+checksum on GCC/Clang
+
+The fused payload copy + RFC 1071 accumulation had its SSSE3 path guarded by
+`__SSSE3__` / `_MSC_VER`. GCC and Clang do not define `__SSSE3__` at the
+default `-march` level, so on Linux the whole vector path was compiled out and
+every data segment fell back to the scalar byte loop - `BuildSegmentPacket`
+absorbed it as 28.05% of all instructions (callgrind,
+`bench_throughput 1048576 1024 0 1 kcc 0`). MSVC was unaffected (`_MSC_VER`
+satisfied the guard), which is why Windows measured ~60% higher than WSL for
+the same source.
+
+The guard is now `XTCP_HAS_SSSE3_CODE` and the two vector routines carry a
+function-scoped `__attribute__((target("ssse3")))` (`XTCP_TARGET_SSSE3`). The
+translation unit's global ISA baseline is unchanged and `CpuHasSsse3()` still
+selects at run time, so CPUs without SSSE3 keep the scalar fallback.
+`Checksum()` also routes header-sized inputs (< 64 B: IPv4 pseudo 12 B, IPv4
+20 B, TCP 20 B) to the scalar loop, where vector setup/drain costs more than
+the word adds.
+
+Deterministic effect (callgrind, same 1 MiB workload, instructions):
+
+| Build | Total Ir | vs scalar |
+|---|---|---|
+| Scalar (`ca519b7`) | 30 398 091 | 1.0000 |
+| SSSE3 enabled | **26 204 645** | **0.8620** |
+
+`CopyAndChecksumSimd` is now 10.46% (2.74 M Ir) as a separate symbol instead of
+28.05% folded into `BuildSegmentPacket`, and `ChecksumSimd` leaves the profile
+entirely. Alternating wall-clock runs stay inside the §5.1 spread and average
++7% (8 rounds, mean ratio 1.0698); the instruction count is the noise-free
+metric.
+
+Correctness: `test_checksum_simd` (SIMD vs scalar differential) passes and the
+full matrix is green (WSL Release 240/240, WSL ASan 240/240, MSVC Release
+239/239, MSVC Debug 239/239).
