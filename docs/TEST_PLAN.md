@@ -211,3 +211,8 @@ and `test_ts_ooo_drain` (RFC 7323 both-sides negotiation and the
 out-of-order-drain TsRecent anchor); the verified runs were
 236/236 (Windows), 238/238 (WSL, incl. conditional interop/lwip targets),
 236/236 with XTCP_CHECKSUM_VALIDATE=ON, both twice.
+
+> Historical record. The current suite is **240/240** on Linux (g++ and
+> clang++, Release and ASan/UBSan) and **239/239** on Windows MSVC
+> Release/Debug, plus **240/240** on the aarch64 cross-build; see
+> `TESTING.md`.

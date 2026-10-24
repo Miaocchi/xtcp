@@ -25,7 +25,7 @@ CMake options (defaults from `CMakeLists.txt`):
 
 | Option | Default | Effect |
 |---|---|---|
-| `XTCP_BUILD_TESTS` | `ON` | The deterministic test suite (236 targets; +1 with `XTCP_BUILD_LWIP`) |
+| `XTCP_BUILD_TESTS` | `ON` | The deterministic test suite (240 targets on Linux, 239 on Windows MSVC) |
 | `XTCP_BUILD_BENCH` | `OFF` | `bench_throughput`, `bench_multi_thread`, `bench_syn_rate`, `bench_conns`, `bench_multi_data`, `bench_thread_e2e` |
 | `XTCP_BUILD_SAMPLES` | `OFF` | `echo` plus TUN-based `interop_*` samples. Interop samples require UNIX (they open `/dev/net/tun`) |
 | `XTCP_BUILD_CC_PLUGINS` | `ON` | Links built-in congestion controls (KCC/BBRv1/CUBIC/Reno) into the static library |

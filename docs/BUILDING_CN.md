@@ -79,17 +79,18 @@ ctest --test-dir build-asan --output-on-failure
 # 一次性：安装交叉工具链 + 用户态仿真器
 sudo apt install g++-13-aarch64-linux-gnu qemu-user
 
-# 树外配置，全静态链接使 qemu 无需 sysroot
+# 树外配置，链接 aarch64 sysroot。不要用全静态链接：插件加载器调用
+# dlopen，静态链接会告警提示运行时仍需要同名 glibc 共享库。
 cmake -B ~/xtcp-arm -S /path/to/xtcp \
   -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
   -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-  -DXTCP_BUILD_TESTS=ON -DXTCP_BUILD_PLUGINS=OFF \
-  -DXTCP_BUILD_BENCH=OFF -DXTCP_BUILD_LWIP=OFF \
-  -DCMAKE_EXE_LINKER_FLAGS=-static
+  -DCMAKE_CROSSCOMPILING_EMULATOR="qemu-aarch64;-L;/usr/aarch64-linux-gnu" \
+  -DXTCP_BUILD_TESTS=ON -DXTCP_BUILD_PLUGINS=ON \
+  -DXTCP_BUILD_BENCH=OFF -DXTCP_BUILD_LWIP=ON
 cmake --build ~/xtcp-arm -j$(nproc)
 
-# 在仿真下逐个运行测试二进制
-qemu-aarch64 ~/xtcp-arm/test_tcp_fsm
+# 在仿真下运行（ctest 使用 CMAKE_CROSSCOMPILING_EMULATOR）
+ctest --test-dir ~/xtcp-arm -j$(nproc)
 ```
 
 依赖该环境前值得了解的实测行为：

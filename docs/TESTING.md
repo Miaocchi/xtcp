@@ -8,7 +8,7 @@ on which platform, and how to extend it. Chinese version:
 
 ## 1. Suite organization
 
-236 registered test executables in the default configuration (a 237th, the lwIP differential target, appears when `XTCP_BUILD_LWIP=ON`), each an independent program built from
+240 registered test executables on Linux (239 on Windows MSVC) in the CI configuration, each an independent program built from
 `tests/*.cpp` and executed by CTest. Naming maps to area:
 
 | Prefix family | Covers |
@@ -57,8 +57,9 @@ What was actually executed, on which tree revision:
 
 | Check | Platform/toolchain | Result |
 |---|---|---|
-| Full suite via CTest | Windows 11, MSVC 14.39, Release | all registered pass: 237/237 with the optional lwIP target, 236/236 without (189 s / 277 s wall) |
-| Full suite, static cross-build | aarch64 GCC 13 under qemu-aarch64 | 237/237 pass (batches 80+80+77, zero failures) |
+| Full suite via CTest | Windows 11, MSVC 14.39, Release and Debug | 239/239 each |
+| Full suite via CTest | Linux, g++ and clang++, Release and ASan/UBSan | 240/240 each, zero warnings |
+| Full suite, sysroot cross-build | aarch64 GCC 13 under `qemu-aarch64 -L /usr/aarch64-linux-gnu` | 240/240, zero warnings |
 | ASan+UBSan full suite ×2 compilers | Linux CI (clang++, g++) | green at source revision `e9d5922` |
 | MSVC full suite | Windows CI | green at source revision `e9d5922` |
 

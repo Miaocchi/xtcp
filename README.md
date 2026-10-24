@@ -70,20 +70,30 @@ commands listed there, best of 3 rounds unless stated.
 | Loopback throughput, 64 KB writes | same | 23.7 Gbps (rounds varied 12.1–23.7) |
 | Loopback throughput, 64 B writes | same | 1.27 Gbps / 3.73 Mpps (packet-rate bound) |
 | Multi-worker RX injection | same, 1 worker | 135.2 Gbps / 11.6 Mpps |
-| Multi-worker RX injection | same, 8 workers | 98.9 Gbps / 8.47 Mpps aggregate |
+| Multi-worker RX injection | same, 8 workers | 98.9 Gbps unpinned; **157-163 Gbps pinned to eight cores** |
 | Connection establishment | same | 566k conns/s sustained over 200k connects |
 | Connection-table sweep | same | idle 0.02 µs/round; dirty 348 ns/conn/round at 10k conns |
 | RTT latency over TUN, 2000×1 KB | WSL2 Ubuntu 24.04, root TUN | p50 194–204 µs, p99 260–267 µs, jitter 17–21 µs, 0 failures |
 | One-way bulk over TUN, 16 MB | same | 1.79–1.81 Gbps (kernel loopback baseline on same host: 21–31 Gbps) |
 | Fairness, 4 flows under tbf+netem | same | shares 24.7–25.3 % each, Jain index 0.9999 |
 
+These rows are the **unpinned** Environment A figures from
+`docs/PERFORMANCE.md` §3. Core-pinned numbers - the only ones comparable
+across revisions, because an unpinned run moves by tens of percent with
+scheduler migration - are in §7.7: 23.0-23.2 Gbps on a single core at
+1460 B, and 157-163 Gbps for eight-core RX injection.
+
 Quality gates behind these numbers:
 
-- Deterministic test suite (virtual clock): every registered test passes on
-  Windows MSVC Release and under `qemu-aarch64` (static cross-build);
-  236 targets by default, 237 with the optional lwIP differential layer.
+- Deterministic test suite: 240/240 on Linux (g++ and clang++, Release and
+  ASan/UBSan), 239/239 on Windows MSVC Release and Debug, 240/240 on an
+  aarch64 cross-build under `qemu-aarch64` (sysroot-linked; a fully static
+  link warns because the plugin loader calls `dlopen`).
+- Zero compiler warnings in every configuration, including the builds that
+  enable `samples/`, `bench/` and the lwIP differential layer.
 - CI runs the suite under ASan+UBSan on Linux (clang++ and g++) and on
-  Windows MSVC; leak-free and crash-free is a merge requirement.
+  Windows MSVC Release and Debug; leak-free and crash-free is a merge
+  requirement.
 
 ## Known limitations
 
@@ -94,10 +104,11 @@ Stated so you can evaluate fit honestly:
    is the TUN character-device copy cost, not the TCP stack; applications
    needing more must use a faster NDI backend (DPDK/EFVI backends are
    reserved but not implemented).
-2. **RX worker scaling is sub-linear.** Under the synthetic segment-
-   injection benchmark, 8 workers aggregate to 98.9 Gbps versus 135.2 Gbps
-   for one worker. Treat multi-core numbers as measured points, not a
-   scaling law.
+2. **RX worker scaling depends on pinning.** Unpinned, 8 workers aggregate
+   to 98.9 Gbps versus 135.2 Gbps for one worker (thread migration across
+   the 32 logical CPUs). Pinned to eight dedicated cores the aggregate is
+   157-163 Gbps, above the single-worker figure. Treat multi-core numbers as
+   measured points with their pinning stated, not as a scaling law.
 3. **Small packets are pps-bound.** A single flow of 64 B writes tops out
    near 3.7 Mpps / 1.27 Gbps.
 4. **TUN interop samples require Linux and root** (`/dev/net/tun`). They do
@@ -109,6 +120,11 @@ Stated so you can evaluate fit honestly:
 7. **Timing-sensitive tests need relaxed deadlines under QEMU**, because
    single-core emulation distorts wall-clock pacing; the suite remains
    deterministic by virtual clock elsewhere.
+8. **Single-flow throughput is CPU-bound.** One in-process flow tops out
+   near 23 Gbps (about 2700 cycles per 1460 B segment). 100 Gbps is reached
+   by sharding flows across cores - eight pinned cores deliver 157-163 Gbps
+   on the RX injection path - or by NIC offload; it is not reachable for a
+   single flow in software at this design point.
 
 ## Quick start
 

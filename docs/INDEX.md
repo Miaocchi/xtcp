@@ -59,7 +59,7 @@ src/qdisc/        FQ / fq_codel / cake / TBF queueing disciplines
 src/cc/           KCC, Reno, CUBIC, BBRv1 congestion controls
 include/xtcp/ndi/ backend interfaces (manual, tun, tap)
 plugins/ref/      reference CC cores used for differential testing
-tests/            237-test deterministic suite (+ harness/)
+tests/            240-test deterministic suite (+ harness/)
 samples/          interop samples (TUN-based, Linux) and echo demo
 bench/            micro-benchmarks cited by PERFORMANCE.md
 ```

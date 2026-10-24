@@ -24,7 +24,7 @@ CMake 选项（默认值来自 `CMakeLists.txt`）：
 
 | 选项 | 默认 | 作用 |
 |---|---|---|
-| `XTCP_BUILD_TESTS` | `ON` | 确定性测试套件（236 项目标；开 `XTCP_BUILD_LWIP` 后 +1） |
+| `XTCP_BUILD_TESTS` | `ON` | 确定性测试套件（Linux 240 项目标，Windows MSVC 239 项） |
 | `XTCP_BUILD_BENCH` | `OFF` | `bench_throughput`、`bench_multi_thread`、`bench_syn_rate`、`bench_conns`、`bench_multi_data`、`bench_thread_e2e` |
 | `XTCP_BUILD_SAMPLES` | `OFF` | `echo` 与基于 TUN 的 `interop_*` 样例。互操作样例需要 UNIX（打开 `/dev/net/tun`） |
 | `XTCP_BUILD_CC_PLUGINS` | `ON` | 把内置拥塞控制（KCC/BBRv1/CUBIC/Reno）链入静态库 |

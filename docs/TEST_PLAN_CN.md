@@ -148,3 +148,7 @@ RFC 覆盖（每行至少由一个专项测试钉定；1b 的真实内核互操�
 | 8985 | TLP 尾部丢失探测 + RACK 时间判定 | `test_tlp`、`test_rack` |
 
 测试计数：每平台注册 236 个测试可执行文件（Windows + WSL，另含两平台 ASan/LSan 构建）。新增 `test_ts_both_sides` 与 `test_ts_ooo_drain`（RFC 7323 双端协商、OOO 排干 TsRecent 锚定）；已验证运行：Windows 236/236、WSL 238/238（含条件注册的 interop/lwip 目标）、校验和 ON 236/236，各两轮。
+
+> 历史记录。当前套件为 Linux **240/240**（g++ 与 clang++，Release 与
+> ASan/UBSan）、Windows MSVC Release/Debug **239/239**、aarch64 交叉构建
+> **240/240**；详见 `TESTING_CN.md`。

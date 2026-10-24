@@ -55,7 +55,7 @@ src/qdisc/        FQ / fq_codel / cake / TBF 队列规则
 src/cc/           KCC、Reno、CUBIC、BBRv1 拥塞控制
 include/xtcp/ndi/ 后端接口（manual、tun、tap）
 plugins/ref/      用于差分测试的参考 CC 核心
-tests/            237 项确定性测试套件（含 harness/）
+tests/            240 项确定性测试套件（含 harness/）
 samples/          互操作样例（基于 TUN，Linux）与 echo 演示
 bench/            PERFORMANCE.md 引用的微基准
 ```

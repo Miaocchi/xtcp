@@ -87,17 +87,19 @@ The stack is verified on a second architecture without ARM hardware:
 # One-time: install cross toolchain + user-mode emulator
 sudo apt install g++-13-aarch64-linux-gnu qemu-user
 
-# Configure out-of-tree, fully static so qemu needs no sysroot
+# Configure out-of-tree, linked against the aarch64 sysroot. Do not use a
+# fully static link: the plugin loader calls dlopen, and the static link then
+# warns that the glibc shared objects are still required at run time.
 cmake -B ~/xtcp-arm -S /path/to/xtcp \
   -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
   -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-  -DXTCP_BUILD_TESTS=ON -DXTCP_BUILD_PLUGINS=OFF \
-  -DXTCP_BUILD_BENCH=OFF -DXTCP_BUILD_LWIP=OFF \
-  -DCMAKE_EXE_LINKER_FLAGS=-static
+  -DCMAKE_CROSSCOMPILING_EMULATOR="qemu-aarch64;-L;/usr/aarch64-linux-gnu" \
+  -DXTCP_BUILD_TESTS=ON -DXTCP_BUILD_PLUGINS=ON \
+  -DXTCP_BUILD_BENCH=OFF -DXTCP_BUILD_LWIP=ON
 cmake --build ~/xtcp-arm -j$(nproc)
 
-# Run each test binary under emulation
-qemu-aarch64 ~/xtcp-arm/test_tcp_fsm
+# Run under emulation (ctest uses CMAKE_CROSSCOMPILING_EMULATOR)
+ctest --test-dir ~/xtcp-arm -j$(nproc)
 ```
 
 Observed behavior worth knowing before you rely on this lab:

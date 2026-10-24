@@ -63,20 +63,26 @@ flowchart LR
 | 环回吞吐，64 KB 写入 | 同上 | 23.7 Gbps（各轮波动 12.1–23.7） |
 | 环回吞吐，64 B 写入 | 同上 | 1.27 Gbps / 3.73 Mpps（受包速率限制） |
 | 多 worker RX 注入 | 同上，1 worker | 135.2 Gbps / 11.6 Mpps |
-| 多 worker RX 注入 | 同上，8 workers | 聚合 98.9 Gbps / 8.47 Mpps |
+| 多 worker RX 注入 | 同上，8 workers | 未绑核聚合 98.9 Gbps；**绑 8 核后 157–163 Gbps** |
 | 连接建立速率 | 同上 | 20 万次连续建连，持续 566k conns/s |
 | 连接表扫描 | 同上 | idle 0.02 µs/轮；1 万连接 dirty 348 ns/conn/轮 |
 | TUN 往返延迟，2000×1 KB | WSL2 Ubuntu 24.04，root TUN | p50 194–204 µs，p99 260–267 µs，抖动 17–21 µs，0 失败 |
 | TUN 单向批量，16 MB | 同上 | 1.79–1.81 Gbps（同主机内核环回基线 21–31 Gbps） |
 | 公平性，tbf+netem 下 4 流 | 同上 | 各流占比 24.7–25.3 %，Jain 指数 0.9999 |
 
+以上为 `docs/PERFORMANCE_CN.md` §3 中**未绑核**的环境 A 数据。跨版本可比的
+只有绑核数据（未绑核单次运行会因调度迁移波动数十个百分点），见 §7.7：单核
+1460 B 为 23.0–23.2 Gbps，八核 RX 注入为 157–163 Gbps。
+
 这些数字背后的质量门：
 
-- 确定性测试套件（虚拟时钟驱动）：Windows MSVC Release 与 `qemu-aarch64`
-  （静态交叉构建）下注册项全部通过；默认 236 项目标，含可选 lwIP 差分层
-  时 237 项。
-- CI 在 Linux（clang++ 与 g++）ASan+UBSan 及 Windows MSVC 下运行全量套件；
-  零泄漏零崩溃是合并的必要条件。
+- 确定性测试套件：Linux 240/240（g++ 与 clang++，Release 与 ASan/UBSan 各
+  两套）、Windows MSVC Release/Debug 239/239、aarch64 交叉构建在
+  `qemu-aarch64` 下 240/240（sysroot 动态链接；全静态链接会因插件加载器
+  使用 `dlopen` 产生告警）。
+- 所有配置零编译警告，包括开启 `samples/`、`bench/` 与 lwIP 差分层的构建。
+- CI 在 Linux（clang++ 与 g++）ASan+UBSan 及 Windows MSVC Release/Debug 下
+  运行全量套件；零泄漏零崩溃是合并的必要条件。
 
 ## 已知局限
 
@@ -86,9 +92,10 @@ flowchart LR
    环回基线为 21–31 Gbps。瓶颈在 TUN 字符设备的拷贝成本，不在 TCP 栈；
    需要更高吞吐的应用必须换更快的 NDI 后端（DPDK/EFVI 后端为预留接口，
    尚未实现）。
-2. **RX worker 扩展性次线性。** 在合成段注入基准下，8 worker 聚合
-   98.9 Gbps，低于单 worker 的 135.2 Gbps。多核数字应视为实测点，而非
-   扩展律。
+2. **RX worker 扩展性取决于绑核。** 未绑核时 8 worker 聚合 98.9 Gbps，
+   低于单 worker 的 135.2 Gbps（工作线程在 32 个逻辑 CPU 间迁移）。绑死
+   8 个物理核后聚合为 157–163 Gbps，高于单 worker。多核数字须连同绑核方式
+   一起引用，不能当作扩展律。
 3. **小包受包速率限制。** 单流 64 B 写入上限约 3.7 Mpps / 1.27 Gbps。
 4. **TUN 互操作样例需要 Linux 与 root**（`/dev/net/tun`），Windows 主机
    不参与构建。
@@ -98,6 +105,9 @@ flowchart LR
    `include/xtcp/options/options.h` 文档注释）。
 7. **QEMU 下时序敏感测试需放宽截止时间**：单核仿真会扭曲墙钟节奏；其余
    场景套件由虚拟时钟保证确定性。
+8. **单流吞吐受 CPU 限制。** 单条进程内流上限约 23 Gbps（每 1460 B 段约
+   2700 cycles）。100 Gbps 依靠多核分片（绑 8 核在 RX 注入路径上达
+   157–163 Gbps）或网卡卸载实现；在当前设计下，单流纯软件达不到。
 
 ## 快速上手
 

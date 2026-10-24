@@ -7,7 +7,7 @@
 
 ## 1. 套件组织
 
-默认配置注册 236 个测试可执行文件（第 237 个为 lwIP 差分目标，`XTCP_BUILD_LWIP=ON` 时出现），各自独立成程序，由 `tests/*.cpp` 构建并经 CTest
+CI 配置下 Linux 注册 240 个测试可执行文件（Windows MSVC 为 239 个），各自独立成程序，由 `tests/*.cpp` 构建并经 CTest
 执行。命名对应领域：
 
 | 前缀族 | 覆盖 |
@@ -50,8 +50,9 @@
 
 | 检查 | 平台/工具链 | 结果 |
 |---|---|---|
-| CTest 全量套件 | Windows 11，MSVC 14.39，Release | 注册项全部通过：含可选 lwIP 目标 237/237，不含 236/236（墙钟 189 秒 / 277 秒） |
-| 全量套件，静态交叉构建 | aarch64 GCC 13 under qemu-aarch64 | 237/237 通过（80+80+77 三批，零失败） |
+| CTest 全量套件 | Windows 11，MSVC 14.39，Release 与 Debug | 各 239/239 |
+| CTest 全量套件 | Linux，g++ 与 clang++，Release 与 ASan/UBSan | 各 240/240，零警告 |
+| 全量套件，sysroot 交叉构建 | aarch64 GCC 13 under `qemu-aarch64 -L /usr/aarch64-linux-gnu` | 240/240，零警告 |
 | ASan+UBSan 全量 ×2 编译器 | Linux CI（clang++、g++） | 源码版本 `e9d5922` 全绿 |
 | MSVC 全量套件 | Windows CI | 源码版本 `e9d5922` 全绿 |
 
