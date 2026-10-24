@@ -90,10 +90,16 @@ int main() {
     xtcp::buf::InitPools();
 
     const UInt32 kChunk = 256;
-    const UInt32 kIdleUs = 80000;    // short idle: an idle conn aborts ~170 ms in
+    // Keepalive idle threshold. Scenario 1 asserts that flowing data
+    // prevents a probe; the margin must survive a scheduler stall, not
+    // just the 20 ms send cadence (under ASan + parallel ctest a >80 ms
+    // stall fired a legitimate probe and failed the assertion). 400 ms
+    // idle against a 20 ms cadence gives a 20x margin and still probes
+    // long before the 3 x 30 ms abort sequence (~490 ms).
+    const UInt32 kIdleUs = 400000;
     const UInt32 kIntvlUs = 30000;
     const UInt32 kCnt = 3;
-    const UInt32 kRunMs = 200;
+    const UInt32 kRunMs = 600;   // 20 ms cadence, well under kIdleUs
 
     // ---- Scenario 1: data flow (256 B / 20 ms) prevents probes/Abort ----
     {
@@ -267,9 +273,11 @@ int main() {
         }
         CHECK(sent == bytes_recv);
 
-        // Phase 2: idle gap > idle (80 ms) with keepalive armed: a probe
-        // fires and is answered - it must NOT kill the connection.
-        const auto t_gap = std::chrono::steady_clock::now() + std::chrono::milliseconds(120);
+        // Phase 2: idle gap > idle (400 ms) with keepalive armed: a probe
+        // fires and is answered - it must NOT kill the connection. The gap
+        // is 600 ms (1.5x the idle threshold) so a short scheduler stall
+        // cannot decide the outcome.
+        const auto t_gap = std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
         while (std::chrono::steady_clock::now() < t_gap) {
             Pump(backend_a, backend_b, stack_a, stack_b);
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
