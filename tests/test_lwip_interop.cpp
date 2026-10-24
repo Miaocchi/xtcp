@@ -342,7 +342,7 @@ int main() {
         UInt32 n = g_backend.PollTx(pkt);
         while (0 < n) {
             ValidateChecksums(pkt, n);
-            struct pbuf* p = pbuf_alloc(PBUF_RAW, n, PBUF_POOL);
+            struct pbuf* p = pbuf_alloc(PBUF_RAW, static_cast<u16_t>(n), PBUF_POOL);
             if (p != NULLPTR) {
                 std::memcpy(p->payload, pkt, n);
                 ip4_input(p, &g_netif);
