@@ -111,7 +111,7 @@ int main() {
             }
             const auto start = std::chrono::steady_clock::now();
             for (UInt32 i = 0; i < n; ++i) {
-                workers.emplace_back([&ctxs, &stack, i, n, &segments]() {
+                workers.emplace_back([&ctxs, &stack, i, &segments]() {
                     WorkerCtx& c = ctxs[i];
                     const UInt16 sport = static_cast<UInt16>(20000 + i);
                     UInt32 seq = 1000 + i * 100000;

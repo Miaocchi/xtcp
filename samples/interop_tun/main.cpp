@@ -273,7 +273,7 @@ int main(int argc, char** argv) {
             }
         }
     };
-    stack.SetRecvHandler([&stack, &pending, &pending_mutex, &echo_ok, &echo_fail,
+    stack.SetRecvHandler([&pending, &pending_mutex, &echo_ok, &echo_fail,
                           &echo_conn, &flush_pending](UInt64 conn_id, const Byte* data, UInt32 len) {
         if (0 == echo_conn.load()) {
             echo_conn.store(conn_id);

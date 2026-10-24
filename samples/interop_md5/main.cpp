@@ -54,7 +54,7 @@ namespace {
     constexpr UInt32 kTunV4    = 0x0A000001;   // 10.0.0.1 (TUN iface)
     constexpr UInt16 kPortA    = 4460;         // xtcp listener (A/B/E/F)
     constexpr UInt16 kPortC    = 4461;         // kernel listener (C/D)
-    constexpr UInt32 kBytes    = 256 * 1024;
+    [[maybe_unused]] constexpr UInt32 kBytes    = 256 * 1024;
 
     // 16-byte MD5 keys: K (shared) and W (wrong).
     constexpr Byte kKeyK[16] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
@@ -69,9 +69,9 @@ namespace {
         const bool o1 = tun.Open("xtcp0");
         const bool o2 = tun.AssignAddress(kTunV4, 0xFFFFFF00);
         const bool o3 = tun.BringUp();
-        std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
         // Fast SYN failure for A/B: 1 retry ~ 3s instead of 30s.
-        std::system("sysctl -w net.ipv4.tcp_syn_retries=1 >/dev/null 2>&1 || true");
+        (void)!std::system("sysctl -w net.ipv4.tcp_syn_retries=1 >/dev/null 2>&1 || true");
         std::fprintf(stderr, "[md5] tun open=%d addr=%d up=%d\n", o1 ? 1 : 0, o2 ? 1 : 0, o3 ? 1 : 0);
     }
 
@@ -91,7 +91,7 @@ namespace {
         }
     }
 
-    void FillPattern(std::vector<Byte>& v, UInt32 seed) noexcept {
+    [[maybe_unused]] void FillPattern(std::vector<Byte>& v, UInt32 seed) noexcept {
         for (UInt32 i = 0; i < v.size(); ++i) {
             v[i] = static_cast<Byte>((i * 29 + seed * 13 + 5) & 0xFF);
         }

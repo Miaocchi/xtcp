@@ -45,7 +45,7 @@ namespace {
         const bool o1 = tun.Open("xtcp0");
         const bool o2 = tun.AssignAddress(kTunV4, 0xFFFFFF00);
         const bool o3 = tun.BringUp();
-        std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
         std::fprintf(stderr, "[thr] tun open=%d addr=%d up=%d\n", o1 ? 1 : 0, o2 ? 1 : 0, o3 ? 1 : 0);
     }
 
@@ -191,7 +191,7 @@ int main() {
             }
             // Echo loop: drain the conn's rx buffer and Send it back.
             UInt32 echoed = 0;
-            UInt32 busy = 0;
+            [[maybe_unused]] UInt32 busy = 0;
             const auto t1 = std::chrono::steady_clock::now();
             while (echoed < kBytes &&
                    std::chrono::duration<Double>(std::chrono::steady_clock::now() - t1).count() < 60.0) {

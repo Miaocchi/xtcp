@@ -39,7 +39,7 @@ namespace {
         const bool o1 = tun.Open("xtcp0");
         const bool o2 = tun.AssignAddress(kTunV4, 0xFFFFFF00);
         const bool o3 = tun.BringUp();
-        std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
         std::fprintf(stderr, "[fair] tun open=%d addr=%d up=%d\n", o1 ? 1 : 0, o2 ? 1 : 0, o3 ? 1 : 0);
     }
 
@@ -53,20 +53,20 @@ namespace {
         // exists for the netem child qdisc to attach to.
         char cmd[256];
         std::snprintf(cmd, sizeof(cmd), "modprobe ifb numifbs=1 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         std::snprintf(cmd, sizeof(cmd), "ip link add ifb0 type ifb 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         std::snprintf(cmd, sizeof(cmd), "ip link set ifb0 up 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         // Reset the whole chain.
         std::snprintf(cmd, sizeof(cmd), "tc filter del dev xtcp0 parent ffff: 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         std::snprintf(cmd, sizeof(cmd), "tc qdisc del dev xtcp0 root 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         std::snprintf(cmd, sizeof(cmd), "tc qdisc del dev xtcp0 ingress 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         std::snprintf(cmd, sizeof(cmd), "tc qdisc del dev ifb0 root 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         // Data path: TUN ingress -> ifb0 -> tbf rate + netem delay.
         std::snprintf(cmd, sizeof(cmd), "tc qdisc add dev xtcp0 handle ffff: ingress");
         const Int32 rc1 = std::system(cmd);

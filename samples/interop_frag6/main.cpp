@@ -45,7 +45,7 @@
 namespace {
     // fd00::2 (xtcp virtual listener) / fd00::1 (TUN iface).
     constexpr UInt32 kServerV4[4] = { 0xFD000000, 0, 0, 0x00000002 };
-    constexpr UInt32 kTunV4[4]    = { 0xFD000000, 0, 0, 0x00000001 };
+[[maybe_unused]]     constexpr UInt32 kTunV4[4]    = { 0xFD000000, 0, 0, 0x00000001 };
     constexpr UInt16 kPort        = 4457;
     constexpr UInt32 kBytes       = 512 * 1024;   // 512 KB pattern
     constexpr UInt32 kChunk       = 32768;

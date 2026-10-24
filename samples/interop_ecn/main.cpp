@@ -62,7 +62,7 @@ namespace {
         const bool o1 = tun.Open("xtcp0");
         const bool o2 = tun.AssignAddress(kTunV4, 0xFFFFFF00);
         const bool o3 = tun.BringUp();
-        std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
         std::fprintf(stderr, "[ecn] tun open=%d addr=%d up=%d\n", o1 ? 1 : 0, o2 ? 1 : 0, o3 ? 1 : 0);
     }
 
@@ -239,7 +239,7 @@ int main() {
     bool ok = true;
 
     // A: ECN negotiation - kernel client with ECN enabled.
-    std::system("echo 1 > /proc/sys/net/ipv4/tcp_ecn");
+    (void)!std::system("echo 1 > /proc/sys/net/ipv4/tcp_ecn");
     {
         UInt32 received = 0;
         const Int32 a_rc = KernelClient(kServerV4, kPort, received);
@@ -306,7 +306,7 @@ int main() {
 
     // C: non-ECN control - the same ECN-armed listener must not offer ECN
     // to a plain client: the kernel's data carries no ECT bits.
-    std::system("echo 0 > /proc/sys/net/ipv4/tcp_ecn");
+    (void)!std::system("echo 0 > /proc/sys/net/ipv4/tcp_ecn");
     g_ect_data.store(0);
     g_plain_data.store(0);
     {
@@ -322,7 +322,7 @@ int main() {
     loop.join();
     rc = (ok && 0 == g_failures) ? 0 : 1;
     }
-    std::system("echo 0 > /proc/sys/net/ipv4/tcp_ecn");
+    (void)!std::system("echo 0 > /proc/sys/net/ipv4/tcp_ecn");
     xtcp::buf::ShutdownPools();
     std::fprintf(stderr, rc ? "[ecn] FAILED\n" : "[ecn] PASSED\n");
     return rc;

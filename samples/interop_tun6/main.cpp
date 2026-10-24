@@ -41,8 +41,8 @@ namespace {
 
     std::atomic<UInt64> g_recv = 0;
     std::atomic<UInt64> g_echo_ok = 0;
-    std::atomic<UInt64> g_echo_fail = 0;
-    std::atomic<UInt64> g_x2k_recv = 0;
+    [[maybe_unused]] std::atomic<UInt64> g_echo_fail = 0;
+    [[maybe_unused]] std::atomic<UInt64> g_x2k_recv = 0;
     std::atomic<UInt64> g_x2k_sent = 0;
 
     void SetupTun6(xtcp::samples::TunBackend& tun) noexcept {
@@ -106,7 +106,7 @@ int main() {
                 }
             }
         };
-        stack.SetRecvHandler([&stack, &pending, &pending_mutex, &flush_pending](
+        stack.SetRecvHandler([&pending, &pending_mutex, &flush_pending](
                                  UInt64 conn_id, const Byte* data, UInt32 len) {
             g_recv += len;
             {

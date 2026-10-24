@@ -42,10 +42,10 @@ namespace {
 
     void SetupTun(xtcp::samples::TunBackend& tun) noexcept {
         tun.Open("xtcp0");
-        std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
         tun.BringUp();
-        std::system("ip -6 route replace fd00::2/128 dev xtcp0 2>/dev/null || true");
-        std::system("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true");
+        (void)!std::system("ip -6 route replace fd00::2/128 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true");
     }
 
     void FillPattern(std::vector<Byte>& v, UInt32 seed) noexcept {

@@ -24,7 +24,19 @@ namespace xtcp {
     namespace samples {
         namespace {
             constexpr const char* kTunDevice = "/dev/net/tun";
-            constexpr UInt32 kMaxFrame = 65536;
+            [[maybe_unused]] constexpr UInt32 kMaxFrame = 65536;
+            // ifreq.ifr_name is a fixed IFNAMSIZ (16) byte field the kernel
+            // reads as a C string. Copy explicitly and terminate: strncpy
+            // with IFNAMSIZ - 1 relies on the surrounding memset for the
+            // terminator, which GCC reports as possible truncation at every
+            // inlined instance.
+            inline void CopyIfName(char* dst, const char* src) noexcept {
+                std::memset(dst, 0, IFNAMSIZ);
+                if (NULLPTR != src) {
+                    const std::size_t n = std::strlen(src);
+                    std::memcpy(dst, src, (n < IFNAMSIZ) ? n : (IFNAMSIZ - 1));
+                }
+            }
         }
 
         TunBackend::~TunBackend() noexcept {
@@ -86,7 +98,7 @@ namespace xtcp {
             if (0 <= s) {
                 struct ifreq mifr;
                 std::memset(&mifr, 0, sizeof(mifr));
-                std::strncpy(mifr.ifr_name, name_, IFNAMSIZ - 1);
+                CopyIfName(mifr.ifr_name, name_);
                 if (0 == ::ioctl(s, SIOCGIFMTU, &mifr) && 0 < mifr.ifr_mtu) {
                     mtu_ = static_cast<UInt32>(mifr.ifr_mtu);
                 }
@@ -102,7 +114,7 @@ namespace xtcp {
             }
             struct ifreq ifr;
             std::memset(&ifr, 0, sizeof(ifr));
-            std::strncpy(ifr.ifr_name, name_, IFNAMSIZ - 1);
+            CopyIfName(ifr.ifr_name, name_);
 
             struct sockaddr_in* sa = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
             sa->sin_family = AF_INET;
@@ -110,7 +122,7 @@ namespace xtcp {
             const bool addr_ok = (0 == ::ioctl(s, SIOCSIFADDR, &ifr));
 
             std::memset(&ifr, 0, sizeof(ifr));
-            std::strncpy(ifr.ifr_name, name_, IFNAMSIZ - 1);
+            CopyIfName(ifr.ifr_name, name_);
             sa = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_netmask);
             sa->sin_family = AF_INET;
             sa->sin_addr.s_addr = htonl(netmask);
@@ -134,7 +146,7 @@ namespace xtcp {
                 Byte         extra[16];
             } req;
             std::memset(&req, 0, sizeof(req));
-            std::strncpy(req.ifr.ifr_name, name_, IFNAMSIZ - 1);
+            CopyIfName(req.ifr.ifr_name, name_);
             struct sockaddr_in6* sa6 = reinterpret_cast<struct sockaddr_in6*>(&req.ifr.ifr_addr);
             sa6->sin6_family = AF_INET6;
             std::memcpy(sa6->sin6_addr.s6_addr, addr16, 16);
@@ -152,7 +164,7 @@ namespace xtcp {
                     Byte         extra[16];
                 } req4;
                 std::memset(&req4, 0, sizeof(req4));
-                std::strncpy(req4.ifr.ifr_name, name_, IFNAMSIZ - 1);
+                CopyIfName(req4.ifr.ifr_name, name_);
                 struct sockaddr_in6* sa4 = reinterpret_cast<struct sockaddr_in6*>(&req4.ifr.ifr_addr);
                 sa4->sin6_family = AF_INET6;
                 std::memcpy(sa4->sin6_addr.s6_addr, addr16, 16);
@@ -171,7 +183,7 @@ namespace xtcp {
             }
             struct ifreq ifr;
             std::memset(&ifr, 0, sizeof(ifr));
-            std::strncpy(ifr.ifr_name, name_, IFNAMSIZ - 1);
+            CopyIfName(ifr.ifr_name, name_);
             if (0 != ::ioctl(s, SIOCGIFFLAGS, &ifr)) {
                 ::close(s);
                 return false;

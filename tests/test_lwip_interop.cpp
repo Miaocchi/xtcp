@@ -143,7 +143,7 @@ namespace {
     err_t OnSrvRecv(void* arg, struct tcp_pcb* pcb, struct pbuf* p, err_t err) {
         (void)arg; (void)err;
         if (p != NULLPTR) {
-            UInt32 total = 0;
+            [[maybe_unused]] UInt32 total = 0;
             for (struct pbuf* q = p; q != NULLPTR; q = q->next) {
                 const Byte* d = static_cast<const Byte*>(q->payload);
                 for (u16_t i = 0; i < q->len; ++i) {

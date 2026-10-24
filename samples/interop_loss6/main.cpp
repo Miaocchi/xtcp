@@ -37,17 +37,17 @@
 
 namespace {
     constexpr UInt32 kServerV4[4] = { 0xFD000000, 0, 0, 0x00000002 };
-    constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
+[[maybe_unused]]     constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
     constexpr UInt16 kPort     = 4490;
     constexpr UInt32 kBytes    = 2 * 1024 * 1024;   // 2 MB per scenario
 
-    int g_failures = 0;
+    [[maybe_unused]] int g_failures = 0;
 
     void SetupTun(xtcp::samples::TunBackend& tun) noexcept {
         const bool o1 = tun.Open("xtcp0");
-        std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
         const bool o3 = tun.BringUp();
-        std::system("ip -6 route replace fd00::2/128 dev xtcp0 mtu 1500 2>/dev/null || true");
+        (void)!std::system("ip -6 route replace fd00::2/128 dev xtcp0 mtu 1500 2>/dev/null || true");
         std::fprintf(stderr, "[loss] tun open=%d addr=%d up=%d\n", o1 ? 1 : 0, 1, o3 ? 1 : 0);
     }
 
@@ -63,15 +63,15 @@ namespace {
     // carries loss+reorder+delay - the stack must retransmit, driven by
     // the kernel's SACK/duplicate-ACKs, and deliver byte-exact.
     void ApplyImpairment(const char* loss, const char* reorder, const char* delay, bool tx_mode) noexcept {
-        std::system("modprobe ifb numifbs=1 2>/dev/null || true");
-        std::system("ip link add ifb0 type ifb 2>/dev/null || true");
-        std::system("ip link set ifb0 up 2>/dev/null || true");
-        std::system("tc filter del dev xtcp0 parent ffff: 2>/dev/null || true");
-        std::system("tc qdisc del dev xtcp0 root 2>/dev/null || true");
-        std::system("tc qdisc del dev xtcp0 ingress 2>/dev/null || true");
-        std::system("tc qdisc del dev ifb0 root 2>/dev/null || true");
-        std::system("tc qdisc add dev xtcp0 handle ffff: ingress");
-        std::system("tc filter add dev xtcp0 parent ffff: protocol ipv6 u32 match u32 0 0 "
+        (void)!std::system("modprobe ifb numifbs=1 2>/dev/null || true");
+        (void)!std::system("ip link add ifb0 type ifb 2>/dev/null || true");
+        (void)!std::system("ip link set ifb0 up 2>/dev/null || true");
+        (void)!std::system("tc filter del dev xtcp0 parent ffff: 2>/dev/null || true");
+        (void)!std::system("tc qdisc del dev xtcp0 root 2>/dev/null || true");
+        (void)!std::system("tc qdisc del dev xtcp0 ingress 2>/dev/null || true");
+        (void)!std::system("tc qdisc del dev ifb0 root 2>/dev/null || true");
+        (void)!std::system("tc qdisc add dev xtcp0 handle ffff: ingress");
+        (void)!std::system("tc filter add dev xtcp0 parent ffff: protocol ipv6 u32 match u32 0 0 "
                     "action mirred egress redirect dev ifb0");
         char cmd[256];
         if (tx_mode) {
@@ -79,19 +79,19 @@ namespace {
             std::snprintf(cmd, sizeof(cmd),
                           "tc qdisc add dev xtcp0 root handle 1: netem loss %s reorder %s delay %s",
                           loss, reorder, delay);
-            std::system(cmd);
+            (void)!std::system(cmd);
             // Ingress (kernel->stack) gets delay only.
             std::snprintf(cmd, sizeof(cmd),
                           "tc qdisc add dev ifb0 root handle 1: netem delay %s", delay);
-            std::system(cmd);
+            (void)!std::system(cmd);
         } else {
             // Ingress (kernel->stack) carries the impairment.
             std::snprintf(cmd, sizeof(cmd),
                           "tc qdisc add dev ifb0 root handle 1: netem loss %s reorder %s delay %s",
                           loss, reorder, delay);
-            std::system(cmd);
+            (void)!std::system(cmd);
             std::snprintf(cmd, sizeof(cmd), "tc qdisc add dev xtcp0 root handle 1: netem delay %s", delay);
-            std::system(cmd);
+            (void)!std::system(cmd);
         }
         std::fprintf(stderr, "[loss] impairment(tx=%d): loss=%s reorder=%s delay=%s\n",
                      tx_mode ? 1 : 0, loss, reorder, delay);

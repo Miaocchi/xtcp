@@ -349,8 +349,9 @@ int main(int argc, char** argv) {
                      w, (unsigned long long)c.bytes_sent, c.seconds,
                      inflight, cwnd, wnd, retx, (unsigned long long)rto, dup);
     }
-    std::fprintf(stderr, "[shared] sent=%llu recv=%llu guard=%u\n",
-                 (unsigned long long)sent_total, (unsigned long long)recv_total.load(), guard);
+    std::fprintf(stderr, "[shared] sent=%llu recv=%llu guard=%llu\n",
+                 (unsigned long long)sent_total, (unsigned long long)recv_total.load(),
+                 (unsigned long long)guard);
     if (sent_total != recv_total.load() || sent_total != total * workers) {
         std::fprintf(stderr, "SHARED PHASE INCOMPLETE: sent=%llu recv=%llu want=%llu\n",
                      (unsigned long long)sent_total, (unsigned long long)recv_total.load(),

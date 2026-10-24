@@ -28,7 +28,7 @@
 
 namespace {
     constexpr UInt32 kServerV4[4] = { 0xFD000000, 0, 0, 0x00000002 };
-    constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
+[[maybe_unused]]     constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
     constexpr UInt16 kPort     = 4455;
     constexpr UInt32 kMsgSize  = 1024;
     constexpr UInt32 kRounds   = 2000;
@@ -37,9 +37,9 @@ namespace {
 
     void SetupTun(xtcp::samples::TunBackend& tun) noexcept {
         tun.Open("xtcp0");
-        std::system("ip -6 addr add fd00::1/64 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 addr add fd00::1/64 dev xtcp0 2>/dev/null || true");
         tun.BringUp();
-        std::system("ip route add fd00::2/128 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip route add fd00::2/128 dev xtcp0 2>/dev/null || true");
     }
 }
 

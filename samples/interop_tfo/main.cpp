@@ -65,7 +65,7 @@ namespace {
         const bool o1 = tun.Open("xtcp0");
         const bool o2 = tun.AssignAddress(kTunV4, 0xFFFFFF00);
         const bool o3 = tun.BringUp();
-        std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
         std::fprintf(stderr, "[tfo] tun open=%d addr=%d up=%d\n", o1 ? 1 : 0, o2 ? 1 : 0, o3 ? 1 : 0);
     }
 
@@ -261,7 +261,7 @@ int main() {
 
     // B: xtcp client TFO -> kernel server. Enable kernel server-side TFO
     // (plain `sysctl -w` is blocked on WSL2; the proc write works).
-    std::system("echo 3 > /proc/sys/net/ipv4/tcp_fastopen");
+    (void)!std::system("echo 3 > /proc/sys/net/ipv4/tcp_fastopen");
     const Int32 listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     Int32 reuse = 1;
     ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -386,7 +386,7 @@ int main() {
         accept_thread.join();
         ::close(listen_fd);
     }
-    std::system("echo 1 > /proc/sys/net/ipv4/tcp_fastopen");
+    (void)!std::system("echo 1 > /proc/sys/net/ipv4/tcp_fastopen");
 
     stop.store(true);
     loop.join();

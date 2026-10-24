@@ -44,8 +44,8 @@ namespace {
         tun.Open("xtcp0");
         tun.AssignAddress(kTunV4, 0xFFFFFF00);
         tun.BringUp();
-        std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
-        std::system("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true");
+        (void)!std::system("ip route add 10.0.0.2/32 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true");
     }
 
     void FillPattern(std::vector<Byte>& v, UInt32 seed) noexcept {

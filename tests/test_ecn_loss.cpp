@@ -50,8 +50,9 @@ namespace {
     // Wire observers. backend_a's RxHandler (resp. tx queue) sees B->A
     // (resp. A->B) traffic; flags live at byte 33 (IPv4 20 + TCP byte 13).
     // ECE = 0x40, SYN = 0x02, SYN+ACK = 0x12, data (PSH) = 0x08.
-    UInt32 g_tx_seen = 0;        // packets observed on A->B
-    UInt32 g_drop_every = 0;     // drop every Nth A->B packet (0 = none)
+    UInt32 g_first_seen = 0;     // first-seen A->B data segments
+    UInt64 g_data_high = 0;      // highest (seq + payload) seen on the wire
+    UInt32 g_drop_every = 0;     // drop every Nth first-seen data segment (0 = none)
     UInt32 g_drop_count = 0;     // packets actually dropped (blackholed)
     bool g_syn_ece = false;      // A's SYN carried the ECE offer
     bool g_synack_ece = false;   // B's SYN+ACK echoed the ECE offer
@@ -66,8 +67,10 @@ namespace {
 
 /**
  * @brief Pumps A's tx into B and B's tx into A, dropping every g_drop_every
- *        packet observed on the A->B path (retransmissions included, exactly
- *        like test_wscale_transfer.cpp). While polling it also observes the
+ *        FIRST-SEEN data segment on the A->B path. Retransmissions (whole or
+ *        partial) always pass: dropping them too let the Karn-polluted RTO
+ *        back off past the drain budget (the same Debug flake fixed in
+ *        test_wscale_transfer.cpp). While polling it also observes the
  *        wire: handshake ECE negotiation and, for data segments, whether a
  *        sequence number is first-seen (original) or repeated (retransmit)
  *        and whether ECE is present.
@@ -81,7 +84,7 @@ static void PumpLossy(xtcp::ndi::ManualBackend& a, xtcp::ndi::ManualBackend& b,
         while (0 != a.TxPending()) {
             const UInt32 n = a.PollTx(out);
             if (0 < n) {
-                ++g_tx_seen;
+                bool drop = false;
                 if (n > 34) {
                     const Byte flags = out[33];
                     if (0 != (flags & 0x02) && 0 != (flags & 0x40)) {
@@ -98,6 +101,25 @@ static void PumpLossy(xtcp::ndi::ManualBackend& a, xtcp::ndi::ManualBackend& b,
                                            (static_cast<UInt32>(out[25]) << 16) |
                                            (static_cast<UInt32>(out[26]) << 8) |
                                            static_cast<UInt32>(out[27]);
+                        const UInt32 ip_hlen = static_cast<UInt32>(out[0] & 0x0fU) * 4U;
+                        const UInt32 ip_total =
+                            (static_cast<UInt32>(out[2]) << 8) | static_cast<UInt32>(out[3]);
+                        const UInt32 tcp_hlen =
+                            static_cast<UInt32>(out[ip_hlen + 12] >> 4U) * 4U;
+                        const UInt32 payload_len =
+                            (ip_total > ip_hlen + tcp_hlen)
+                                ? (ip_total - ip_hlen - tcp_hlen) : 0;
+                        // Drop keyed on the data frontier, never on a
+                        // retransmission (partial resends carry a different
+                        // sequence number than the dropped original).
+                        if (static_cast<UInt64>(seq) >= g_data_high) {
+                            g_data_high = static_cast<UInt64>(seq) + payload_len;
+                            ++g_first_seen;
+                            if (0 != g_drop_every &&
+                                0 == (g_first_seen % g_drop_every)) {
+                                drop = true;
+                            }
+                        }
                         const bool ect = 0x02 == (out[1] & 0x03);
                         const bool ece = 0 != (flags & 0x40);
                         if (seen_seqs.end() != seen_seqs.find(seq)) {
@@ -120,7 +142,7 @@ static void PumpLossy(xtcp::ndi::ManualBackend& a, xtcp::ndi::ManualBackend& b,
                         }
                     }
                 }
-                if (0 != g_drop_every && 0 == (g_tx_seen % g_drop_every)) {
+                if (drop) {
                     ++g_drop_count;             // blackhole: never injected
                 } else {
                     b.Inject(out, n, 0x0800);
@@ -145,7 +167,8 @@ static void PumpLossy(xtcp::ndi::ManualBackend& a, xtcp::ndi::ManualBackend& b,
 
 /** RFC 3168 ECN + loss + retransmission on the data path (core scenario). */
 static void Scenario1LossyTransfer() {
-    g_tx_seen = 0;
+    g_first_seen = 0;
+    g_data_high = 0;
     g_drop_every = 0;
     g_drop_count = 0;
     g_syn_ece = false;

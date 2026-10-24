@@ -34,7 +34,7 @@
 
 namespace {
     constexpr UInt32 kServerV4[4] = { 0xFD000000, 0, 0, 0x00000002 };
-    constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
+[[maybe_unused]]     constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
     constexpr UInt16 kPort     = 4503;
     constexpr UInt32 kConns    = 8;
     constexpr UInt32 kBytes    = 64 * 1024;
@@ -43,9 +43,9 @@ namespace {
 
     void SetupTun(xtcp::samples::TunBackend& tun) noexcept {
         const bool o1 = tun.Open("xtcp0");
-        std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
         const bool o3 = tun.BringUp();
-        std::system("ip -6 route replace fd00::2/128 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 route replace fd00::2/128 dev xtcp0 2>/dev/null || true");
         std::fprintf(stderr, "[thr] tun open=%d addr=%d up=%d\n", o1 ? 1 : 0, 1, o3 ? 1 : 0);
     }
 
@@ -197,7 +197,7 @@ int main() {
             }
             // Echo loop: drain the conn's rx buffer and Send it back.
             UInt32 echoed = 0;
-            UInt32 busy = 0;
+            [[maybe_unused]] UInt32 busy = 0;
             const auto t1 = std::chrono::steady_clock::now();
             while (echoed < kBytes &&
                    std::chrono::duration<Double>(std::chrono::steady_clock::now() - t1).count() < 60.0) {

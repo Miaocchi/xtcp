@@ -35,22 +35,22 @@
 
 namespace {
     constexpr UInt32 kServerV4[4] = { 0xFD000000, 0, 0, 0x00000002 };
-    constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
+[[maybe_unused]]     constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
     constexpr UInt16 kPort     = 4495;
     constexpr UInt32 kBytes    = 512 * 1024;
-    constexpr UInt32 kStallAt  = 128 * 1024;   // backpressure starts here
-    constexpr UInt32 kStallLen = 2 * 1024 * 1024;  // bytes rejected during the stall window
+    [[maybe_unused]] constexpr UInt32 kStallAt  = 128 * 1024;   // backpressure starts here
+    [[maybe_unused]] constexpr UInt32 kStallLen = 2 * 1024 * 1024;  // bytes rejected during the stall window
     constexpr Double kStallSec = 2.0;
 
     std::atomic<UInt32> g_probes = 0;       // kernel window-probe segments (tiny data)
-    std::atomic<UInt64> g_accepted = 0;     // bytes the stack accepted
-    std::atomic<UInt64> g_rejected = 0;     // bytes the stack backpressured
+    [[maybe_unused]] std::atomic<UInt64> g_accepted = 0;     // bytes the stack accepted
+    [[maybe_unused]] std::atomic<UInt64> g_rejected = 0;     // bytes the stack backpressured
 
     void SetupTun(xtcp::samples::TunBackend& tun) noexcept {
         const bool o1 = tun.Open("xtcp0");
-        std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
         const bool o3 = tun.BringUp();
-        std::system("ip -6 route replace fd00::2/128 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 route replace fd00::2/128 dev xtcp0 2>/dev/null || true");
         std::fprintf(stderr, "[zwin] tun open=%d addr=%d up=%d\n", o1 ? 1 : 0, 1, o3 ? 1 : 0);
     }
 
@@ -190,7 +190,7 @@ int main() {
     const bool probes_seen = (0 < g_probes.load());
     const bool stall_respected = (sec >= kStallSec - 0.2);
     std::fprintf(stderr,
-                 "[zwin] sent=%u rx=%llu rejected=%u probes=%u elapsed=%.2fs\n",
+                 "[zwin] sent=%u rx=%llu rejected=%llu probes=%u elapsed=%.2fs\n",
                  sent, (unsigned long long)rx_bytes.load(),
                  (unsigned long long)g_stall_rejects.load(), g_probes.load(), sec);
     std::fprintf(stderr, "[zwin] all=%d stalled=%d probes=%d time_respected=%d\n",

@@ -33,15 +33,15 @@
 
 namespace {
     constexpr UInt32 kServerV4[4] = { 0xFD000000, 0, 0, 0x00000002 };
-    constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
+[[maybe_unused]]     constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
     constexpr UInt16 kPort     = 4499;
     constexpr UInt32 kBytes    = 256 * 1024;
 
     void SetupTun(xtcp::samples::TunBackend& tun) noexcept {
         const bool o1 = tun.Open("xtcp0");
-        std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
         const bool o3 = tun.BringUp();
-        std::system("ip -6 route replace fd00::2/128 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 route replace fd00::2/128 dev xtcp0 2>/dev/null || true");
         std::fprintf(stderr, "[mimt] tun open=%d addr=%d up=%d\n", o1 ? 1 : 0, 1, o3 ? 1 : 0);
     }
 

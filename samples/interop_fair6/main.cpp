@@ -72,20 +72,20 @@ namespace {
         // exists for the netem child qdisc to attach to.
         char cmd[256];
         std::snprintf(cmd, sizeof(cmd), "modprobe ifb numifbs=1 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         std::snprintf(cmd, sizeof(cmd), "ip link add ifb0 type ifb 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         std::snprintf(cmd, sizeof(cmd), "ip link set ifb0 up 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         // Reset the whole chain.
         std::snprintf(cmd, sizeof(cmd), "tc filter del dev xtcp0 parent ffff: 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         std::snprintf(cmd, sizeof(cmd), "tc qdisc del dev xtcp0 root 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         std::snprintf(cmd, sizeof(cmd), "tc qdisc del dev xtcp0 ingress 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         std::snprintf(cmd, sizeof(cmd), "tc qdisc del dev ifb0 root 2>/dev/null || true");
-        std::system(cmd);
+        (void)!std::system(cmd);
         // Data path: TUN ingress -> ifb0 -> tbf rate + netem delay.
         std::snprintf(cmd, sizeof(cmd), "tc qdisc add dev xtcp0 handle ffff: ingress");
         const Int32 rc1 = std::system(cmd);

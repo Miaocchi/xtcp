@@ -44,7 +44,7 @@
 
 namespace {
     constexpr UInt32 kServerV4[4] = { 0xFD000000, 0, 0, 0x00000002 };
-    constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
+[[maybe_unused]]     constexpr UInt32 kTunV4[4]     = { 0xFD000000, 0, 0, 0x00000001 };
     constexpr UInt16 kPort     = 4480;
     constexpr UInt32 kBytes    = 256 * 1024;
 
@@ -60,9 +60,9 @@ namespace {
 
     void SetupTun(xtcp::samples::TunBackend& tun) noexcept {
         const bool o1 = tun.Open("xtcp0");
-        std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 addr replace fd00::1/64 dev xtcp0 2>/dev/null || true");
         const bool o3 = tun.BringUp();
-        std::system("ip -6 route replace fd00::2/128 dev xtcp0 2>/dev/null || true");
+        (void)!std::system("ip -6 route replace fd00::2/128 dev xtcp0 2>/dev/null || true");
         std::fprintf(stderr, "[ecn] tun open=%d addr=%d up=%d\n", o1 ? 1 : 0, 1, o3 ? 1 : 0);
     }
 
@@ -231,7 +231,7 @@ int main() {
     bool ok = true;
 
     // A: ECN negotiation - kernel client with ECN enabled.
-    std::system("echo 1 > /proc/sys/net/ipv4/tcp_ecn");
+    (void)!std::system("echo 1 > /proc/sys/net/ipv4/tcp_ecn");
     {
         UInt32 received = 0;
         const Int32 a_rc = KernelClient(kPort, received);
@@ -304,7 +304,7 @@ int main() {
 
     // C: non-ECN control - the same ECN-armed listener must not offer ECN
     // to a plain client: the kernel's data carries no ECT bits.
-    std::system("echo 0 > /proc/sys/net/ipv4/tcp_ecn");
+    (void)!std::system("echo 0 > /proc/sys/net/ipv4/tcp_ecn");
     g_ect_data.store(0);
     g_plain_data.store(0);
     {
@@ -320,7 +320,7 @@ int main() {
     loop.join();
     rc = (ok && 0 == g_failures) ? 0 : 1;
     }
-    std::system("echo 0 > /proc/sys/net/ipv4/tcp_ecn");
+    (void)!std::system("echo 0 > /proc/sys/net/ipv4/tcp_ecn");
     xtcp::buf::ShutdownPools();
     std::fprintf(stderr, rc ? "[ecn] FAILED\n" : "[ecn] PASSED\n");
     return rc;
