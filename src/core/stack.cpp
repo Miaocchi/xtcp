@@ -594,10 +594,14 @@ namespace xtcp {
                         // /analyze cannot track the counter through the
                         // FlushBatch lambda and flags batch[batch_count]
                         // as C6385; suppress that false positive here.
+#if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 6385)
+#endif
                         ndi::Packet& out = batch[batch_count];
+#if defined(_MSC_VER)
 #pragma warning(pop)
+#endif
                         out.data = buf.Data();
                         out.len = buf.Len();
                         out.eth_type = eth_type;

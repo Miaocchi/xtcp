@@ -2577,7 +2577,7 @@ namespace {
      */
     UInt32 g_probeUndoCalls = 0;
     UInt32 g_probeCompleteCwr = 0;
-    Byte g_probeCaState = 0xFF;
+    [[maybe_unused]] Byte g_probeCaState = 0xFF;
 
     UInt32 ProbeUndoCwnd(XtcpConnCc* sk) noexcept {
         ++g_probeUndoCalls;
@@ -3935,12 +3935,12 @@ namespace {
         // The phase must NOT end - if the implementation read sk->inflight
         // this row would flip to 1 and catch the regression.
         rs.prior_in_flight_bytes = 0;
-        d.sk.inflight = target + kMss;
+        d.sk.inflight = static_cast<UInt32>(target + kMss);
         CHECK(0u == xtcp::cc::KccTestIsNextCyclePhase(&d.sk, &rs, after_full_length));
 
         // (c) both above the target: end (sanity that the target is real).
         rs.prior_in_flight_bytes = target + kMss;
-        d.sk.inflight = target + kMss;
+        d.sk.inflight = static_cast<UInt32>(target + kMss);
         CHECK(1u == xtcp::cc::KccTestIsNextCyclePhase(&d.sk, &rs, after_full_length));
 
         // (d) B8-D3: the pre-ACK in-flight must also be adjusted by the
