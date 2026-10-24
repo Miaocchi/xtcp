@@ -834,7 +834,7 @@ namespace xtcp {
                     std::chrono::steady_clock::now().time_since_epoch()).count());
         }
 
-        void TcpConn::MaybeMarkAppLimited(UInt32 inflight) noexcept {
+        void TcpConn::MaybeMarkAppLimited(UInt32 inflight, TimePoint now) noexcept {
             // Kernel tcp_rate_check_app_limited (tcp_rate_v66.c:194-207):
             //   1. write_seq - snd_nxt < mss          -> pending_send_ < mss
             //   2. nothing queued in the host (qdisc/NIC) -> tx_idle: the
@@ -850,7 +850,7 @@ namespace xtcp {
             // pacing deadline stands in for the host qdisc's queued packets;
             // a connection waiting on the pacing clock is NOT idle).
             const bool tx_idle = pending_send_.empty() &&
-                                 (0 == pacing_deadline_ || NowUs() >= pacing_deadline_);
+                                 (0 == pacing_deadline_ || now >= pacing_deadline_);
             if (cc::IsAppLimited(static_cast<UInt32>(pending_send_.size()), tx_idle,
                                  inflight_pkts, cwnd_pkts,
                                  lost_out_pkts_, retrans_out_pkts_, peer_mss_)) {
@@ -4478,7 +4478,10 @@ namespace xtcp {
             // Kernel tcp_rate_check_app_limited runs at the sendmsg entry,
             // BEFORE the new data is consumed: an idle burst's first segment
             // must carry the marker so the CC can detect the idle restart.
-            MaybeMarkAppLimited(inflight);
+            // `now` is the SendData entry timestamp: re-reading the clock
+            // here cost one extra vDSO call per application send on the
+            // pacing path (profile: clock_gettime was the top self item).
+            MaybeMarkAppLimited(inflight, now);
             // Segment at the source: one application send may exceed the MSS,
             // but the wire packet must not (DF + MSS negotiation). Buffered
             // bytes are flushed in MSS-sized segments below, so the tx

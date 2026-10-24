@@ -1154,7 +1154,7 @@ namespace xtcp {
              *        non-matching call never clears an existing marker (the
              *        marker is cleared only when delivered passes it).
              */
-            void MaybeMarkAppLimited(UInt32 inflight) noexcept;
+            void MaybeMarkAppLimited(UInt32 inflight, TimePoint now) noexcept;
             /**
              * @brief Kernel tcp_rate_gen's app-limited clear
              *        (tcp_rate_66.c:123-125): runs on EVERY ACK, cumulative

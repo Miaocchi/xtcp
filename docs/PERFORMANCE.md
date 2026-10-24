@@ -300,3 +300,32 @@ metric.
 Correctness: `test_checksum_simd` (SIMD vs scalar differential) passes and the
 full matrix is green (WSL Release 240/240, WSL ASan 240/240, MSVC Release
 239/239, MSVC Debug 239/239).
+
+
+### 7.5 One fewer clock read per send
+
+`MaybeMarkAppLimited` re-read the clock for its pacing-deadline comparison
+although `SendData` already holds the entry timestamp. With KCC pacing active
+that was an extra vDSO `clock_gettime` per application send; the PMU profile
+(`perf record -F 5000 -e cycles`, 128 MiB) put `__vdso_clock_gettime` at
+9.80% self, the largest single entry. The timestamp is now passed through
+(same instant, so semantics are unchanged).
+
+| Build | Total Ir (callgrind, 1 MiB) |
+|---|---|
+| `74b27ed` | 26 326 396 |
+| with the timestamp reuse | **26 122 982** (-0.77%) |
+
+Combined with §7.4 the total is 30 398 091 -> 26 122 982, i.e. -14.1% against
+the scalar build. After the change `__vdso_clock_gettime` is 8.17% of cycles
+and IPC is 1.76. The two remaining per-segment clock reads (one in
+`XtcpStack::Send`, one in `OnPacket`) are required for pacing and for the
+`sent_at` RTT/RACK anchor.
+
+The rest of the profile is flat - buffer refcounting ~14% (one `lock xadd`
+plus cache-line traffic per reference drop, inherent to the pooled
+refcounted design), harness `Pump`/`Inject`/`memmove` ~16% (ManualBackend is
+test infrastructure), `BuildSegmentPacket` 3.3%, `SendData` 3.5%,
+`OnAckReceived` 3.2%, `KccMain` 2.4%, mutexes 2.8%. No single waste item
+remains; further gains would need concurrency or buffer-lifetime changes and
+are treated as out of scope.

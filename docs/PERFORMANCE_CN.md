@@ -272,3 +272,28 @@ TCP 头 20 B）改走标量循环——该尺寸下向量建立/收尾比字加�
 
 正确性：`test_checksum_simd`（SIMD 与标量差分）通过，全矩阵绿（WSL Release
 240/240、WSL ASan 240/240、MSVC Release 239/239、MSVC Debug 239/239）。
+
+
+### 7.5 每次发送少读一次时钟
+
+`MaybeMarkAppLimited` 为了做 pacing 截止时间比较又读了一次时钟，而
+`SendData` 已经持有入口时间戳。KCC pacing 开启时，这等于每次应用发送多一次
+vDSO `clock_gettime`；PMU 剖析（`perf record -F 5000 -e cycles`，128 MiB）显示
+`__vdso_clock_gettime` 自身占 9.80%，是最大单项。现改为把时间戳透传（同一
+时刻，语义不变）。
+
+| 构建 | 总 Ir（callgrind，1 MiB） |
+|---|---|
+| `74b27ed` | 26 326 396 |
+| 复用时间戳 | **26 122 982**（-0.77%） |
+
+叠加 §7.4，总计 30 398 091 -> 26 122 982，相对标量构建 **-14.1%**。改动后
+`__vdso_clock_gettime` 占周期 8.17%，IPC 1.76。剩下每段两次时钟读
+（`XtcpStack::Send` 与 `OnPacket` 各一次）是 pacing 与 `sent_at` RTT/RACK 锚点
+所必需。
+
+剖析其余部分已很平坦：缓冲区引用计数约 14%（每次引用释放一次 `lock xadd` 加
+缓存行流量，是池化引用计数设计的固有成本）、测试夹具 `Pump`/`Inject`/`memmove`
+约 16%（ManualBackend 属测试基础设施）、`BuildSegmentPacket` 3.3%、
+`SendData` 3.5%、`OnAckReceived` 3.2%、`KccMain` 2.4%、互斥锁 2.8%。已无单一
+明显浪费项；再进一步需要改动并发或缓冲区生命周期，按超出范围处理。
