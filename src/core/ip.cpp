@@ -229,6 +229,30 @@ namespace xtcp {
 #endif
         }
 
+        bool CpuHasAvx2() noexcept {
+#if !defined(XTCP_X86)
+            return false;
+#else
+            static const bool has_avx2 = []() noexcept {
+#if defined(_MSC_VER)
+                int cpu_info[4];
+                __cpuidex(cpu_info, 7, 0);
+                return 0 != (cpu_info[1] & (1 << 5));  // EBX bit 5 = AVX2
+#elif defined(__GNUC__) || defined(__clang__)
+                unsigned int eax, ebx, ecx, edx;
+                if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+                    return false;
+                }
+                return 0 != (ebx & (1u << 5));  // EBX bit 5 = AVX2
+#else
+                (void)0;
+                return false;
+#endif
+            }();
+            return has_avx2;
+#endif
+        }
+
         UInt16 Checksum(const void* data, UInt32 len) noexcept {
 #if defined(XTCP_HAS_SSSE3_CODE)
             if (CpuHasSsse3()) {

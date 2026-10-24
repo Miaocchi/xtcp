@@ -24,10 +24,13 @@
  */
 #if defined(XTCP_X86) && (defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__))
 #define XTCP_HAS_SSSE3_CODE 1
+#define XTCP_HAS_AVX2_CODE 1
 #if defined(_MSC_VER)
 #define XTCP_TARGET_SSSE3
+#define XTCP_TARGET_AVX2
 #else
 #define XTCP_TARGET_SSSE3 __attribute__((target("ssse3")))
+#define XTCP_TARGET_AVX2 __attribute__((target("avx2")))
 #endif
 #endif
 
@@ -84,6 +87,11 @@ namespace xtcp {
          *        checksum path is safe. Cached per process (benign race).
          */
         bool CpuHasSsse3() noexcept;
+        /**
+         * @brief True when the CPU has AVX2 (256-bit integer), i.e. the
+         *        32-byte copy+checksum kernel is safe.
+         */
+        bool CpuHasAvx2() noexcept;
         /**
          * @brief Incremental checksum update (RFC 1624).
          * @param old_sum  Previous checksum.

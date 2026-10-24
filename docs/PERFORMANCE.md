@@ -329,3 +329,40 @@ test infrastructure), `BuildSegmentPacket` 3.3%, `SendData` 3.5%,
 `OnAckReceived` 3.2%, `KccMain` 2.4%, mutexes 2.8%. No single waste item
 remains; further gains would need concurrency or buffer-lifetime changes and
 are treated as out of scope.
+
+
+### 7.6 AVX2 fused copy + checksum
+
+§7.4 restored the 16-byte SSSE3 kernel on GCC/Clang. The payload copy and the
+RFC 1071 accumulation now also have a 256-bit AVX2 kernel
+(`CopyAndChecksumAvx2`, 64 bytes per iteration, two independent accumulator
+chains, the same 16 KiB drain, and the same bit-identical accumulation rule:
+`vpshufb` reverses the bytes inside each 128-bit lane and `vpunpck*` zero-extends
+the words into 32-bit lanes). Selection is runtime, `CpuHasAvx2()` then
+`CpuHasSsse3()` then scalar; the function-scoped `target("avx2")` attribute
+keeps the translation unit's global ISA baseline unchanged.
+
+| Build | Total Ir (callgrind, 1 MiB) | Copy+checksum symbol |
+|---|---|---|
+| SSSE3 only (`fb0e51b`) | 26 122 982 | 2 740 233 (10.5%) |
+| AVX2 | **24 730 947** | **1 453 056 (5.9%)** |
+
+Cumulative against the scalar build (`ca519b7`, 30 398 091 Ir): **-18.6%**.
+
+Pinned alternating wall-clock, `bench_throughput 67108864 1460 0 1 kcc`,
+`taskset -c 3`, 12 rounds, scalar build vs this build:
+
+| | Scalar (`ca519b7`) | This build | Ratio |
+|---|---|---|---|
+| Median | 13 258.4 Mbps | **16 740.0 Mbps** | **1.2626** |
+| Mean | 13 282.5 Mbps | 16 189.1 Mbps | 1.2188 |
+| Best | 15 636.1 Mbps | **19 301.3 Mbps** | 1.2344 |
+
+On the Windows host (Environment A) the same command reached 22 674 Mbps
+(best of 5). Absolute numbers on this laptop move by tens of percent with
+background load (§5.1); only the pinned alternating comparison is meaningful.
+
+Correctness: `test_checksum_simd` (SIMD vs scalar differential) passes, the
+transfer tests' rolling-CRC checks pass, and the full matrix is green (WSL
+Release 240/240, WSL ASan 240/240, MSVC Release 239/239, MSVC Debug 239/239)
+with zero warnings on clean builds.

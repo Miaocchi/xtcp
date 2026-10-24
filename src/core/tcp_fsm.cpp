@@ -196,6 +196,94 @@ namespace xtcp {
             }
 #endif  // XTCP_X86 && SSSE3: CopyAndChecksumSimd
 
+#if defined(XTCP_HAS_AVX2_CODE)
+            /**
+             * @brief Fused copy + RFC 1071 checksum (AVX2, 256-bit).
+             *
+             * Same accumulation rule as CopyAndChecksumSimd:
+             * `_mm256_shuffle_epi8` reverses the 16 bytes inside each 128-bit
+             * lane (word order inside a lane does not matter - addition is
+             * commutative and associative), then `unpack*_epi16` zero-extends
+             * the words into 32-bit lanes so a byte carry can never cross a
+             * word boundary. 64 bytes per iteration with two independent
+             * accumulator chains; the periodic drain (every 16 KiB, as in the
+             * SSSE3 kernel) keeps every lane far below 2^32.
+             */
+            XTCP_TARGET_AVX2 inline UInt16 CopyAndChecksumAvx2(Byte* dst, const Byte* src, UInt32 len) noexcept {
+                const __m128i rev128 = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+                const __m256i rev = _mm256_broadcastsi128_si256(rev128);
+                const __m256i zero = _mm256_setzero_si256();
+                __m256i acc0 = _mm256_setzero_si256();
+                __m256i acc1 = _mm256_setzero_si256();
+                UInt64 sum = 0;
+                UInt32 n = len;
+                while (64 <= n) {
+                    __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+                    __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 32));
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), x);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + 32), y);
+                    x = _mm256_shuffle_epi8(x, rev);
+                    y = _mm256_shuffle_epi8(y, rev);
+                    acc0 = _mm256_add_epi32(acc0, _mm256_unpacklo_epi16(x, zero));
+                    acc0 = _mm256_add_epi32(acc0, _mm256_unpackhi_epi16(x, zero));
+                    acc1 = _mm256_add_epi32(acc1, _mm256_unpacklo_epi16(y, zero));
+                    acc1 = _mm256_add_epi32(acc1, _mm256_unpackhi_epi16(y, zero));
+                    src += 64;
+                    dst += 64;
+                    n -= 64;
+                    if (0 == (n & 0x3FFF)) {
+                        alignas(32) UInt32 lanes[8];
+                        _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc0);
+                        for (UInt32 i = 0; i < 8; ++i) {
+                            sum += lanes[i];
+                        }
+                        _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc1);
+                        for (UInt32 i = 0; i < 8; ++i) {
+                            sum += lanes[i];
+                        }
+                        acc0 = _mm256_setzero_si256();
+                        acc1 = _mm256_setzero_si256();
+                    }
+                }
+                alignas(32) UInt32 lanes_end[8];
+                _mm256_store_si256(reinterpret_cast<__m256i*>(lanes_end), acc0);
+                for (UInt32 i = 0; i < 8; ++i) {
+                    sum += lanes_end[i];
+                }
+                _mm256_store_si256(reinterpret_cast<__m256i*>(lanes_end), acc1);
+                for (UInt32 i = 0; i < 8; ++i) {
+                    sum += lanes_end[i];
+                }
+                while (4 <= n) {
+                    UInt32 w;
+                    std::memcpy(&w, src, 4);
+                    sum += Byteswap32(w);
+                    std::memcpy(dst, &w, 4);
+                    src += 4;
+                    dst += 4;
+                    n -= 4;
+                }
+                while (1 < n) {
+                    UInt16 w;
+                    std::memcpy(&w, src, 2);
+                    sum += Byteswap16(w);
+                    std::memcpy(dst, &w, 2);
+                    src += 2;
+                    dst += 2;
+                    n -= 2;
+                }
+                if (0 < n) {
+                    dst[0] = src[0];
+                    sum += static_cast<UInt16>(static_cast<UInt16>(src[0]) << 8);
+                }
+                while (0 != (sum >> 16)) {
+                    sum = (sum & 0xFFFF) + (sum >> 16);
+                }
+                return static_cast<UInt16>(~sum & 0xFFFF);
+            }
+#endif  // XTCP_HAS_AVX2_CODE: CopyAndChecksumAvx2
+
+
 #if defined(XTCP_ARM) && defined(__ARM_NEON)
             /**
              * @brief Fused copy + RFC 1071 checksum (vectorized path, ARM NEON).
@@ -290,6 +378,14 @@ namespace xtcp {
              *        (signature connections read the payload once, not twice).
              */
             inline UInt16 CopyAndChecksum(Byte* dst, const Byte* src, UInt32 len, Md5Ctx* md5 = NULLPTR) noexcept {
+#if defined(XTCP_HAS_AVX2_CODE)
+                // MD5 interleaving is inherently scalar; the vectorized
+                // paths serve the (common) unsigned fast path. AVX2
+                // first: 32-byte lanes halve the SSSE3 loop count.
+                if (NULLPTR == md5 && CpuHasAvx2()) {
+                    return CopyAndChecksumAvx2(dst, src, len);
+                }
+#endif
 #if defined(XTCP_HAS_SSSE3_CODE)
                 // MD5 interleaving is inherently scalar; the vectorized path
                 // serves the (common) unsigned fast path.

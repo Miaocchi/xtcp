@@ -297,3 +297,36 @@ vDSO `clock_gettime`；PMU 剖析（`perf record -F 5000 -e cycles`，128 MiB）
 约 16%（ManualBackend 属测试基础设施）、`BuildSegmentPacket` 3.3%、
 `SendData` 3.5%、`OnAckReceived` 3.2%、`KccMain` 2.4%、互斥锁 2.8%。已无单一
 明显浪费项；再进一步需要改动并发或缓冲区生命周期，按超出范围处理。
+
+
+### 7.6 AVX2 融合拷贝 + 校验和
+
+§7.4 在 GCC/Clang 上恢复了 16 字节 SSSE3 内核。负载拷贝与 RFC 1071 累加现在
+再增加一个 256 位 AVX2 内核（`CopyAndChecksumAvx2`：每迭代 64 字节、两条独立
+累加链、同样的 16 KiB 汇合、同样的位等累加规则——`vpshufb` 在每个 128 位通道
+内反转字节，`vpunpck*` 把 16 位字零扩展到 32 位通道）。分派顺序为运行时
+`CpuHasAvx2()` → `CpuHasSsse3()` → 标量；函数级 `target("avx2")` 属性保证翻译
+单元的全局 ISA 基线不变。
+
+| 构建 | 总 Ir（callgrind，1 MiB） | 拷贝+校验和符号 |
+|---|---|---|
+| 仅 SSSE3（`fb0e51b`） | 26 122 982 | 2 740 233（10.5%） |
+| AVX2 | **24 730 947** | **1 453 056（5.9%）** |
+
+相对标量构建（`ca519b7`，30 398 091 Ir）累计 **-18.6%**。
+
+绑核交替墙钟，`bench_throughput 67108864 1460 0 1 kcc`、`taskset -c 3`、12 轮，
+标量构建对比本构建：
+
+| | 标量（`ca519b7`） | 本构建 | 比值 |
+|---|---|---|---|
+| 中位数 | 13 258.4 Mbps | **16 740.0 Mbps** | **1.2626** |
+| 均值 | 13 282.5 Mbps | 16 189.1 Mbps | 1.2188 |
+| 最优 | 15 636.1 Mbps | **19 301.3 Mbps** | 1.2344 |
+
+Windows 宿主（Environment A）同一命令最优 22 674 Mbps（5 次）。本机绝对数字随
+后台负载可有数十个百分点波动（§5.1），只有绑核交替对比才有意义。
+
+正确性：`test_checksum_simd`（SIMD 与标量差分）通过，各传输测试的滚动 CRC 通过，
+全矩阵绿（WSL Release 240/240、WSL ASan 240/240、MSVC Release 239/239、
+MSVC Debug 239/239），干净构建零警告。
