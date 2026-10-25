@@ -741,6 +741,8 @@ namespace xtcp {
         // foreign shard's drain without that lock, so the push must be
         // lock-free (a deque push would race the sweep's locked pop).
         void XtcpStack::EmitOrRetry(Shard& shard, ndi::Packet&& out) noexcept {
+            // Serialized: see backend_tx_mutex_ (a backend's transmit queue
+            // tolerates one writer; shards emit concurrently otherwise).
             bool accepted = false;
             {
                 std::lock_guard<std::recursive_mutex> scope(backend_tx_mutex_);
