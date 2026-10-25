@@ -175,7 +175,8 @@ namespace xtcp {
 
         // RFC 793: RST for a SYN to a closed port (connection refused), with
         // ACK = SYN seq+1 so the client accepts it in SYN-SENT.
-        void SendClosedPortRst(ndi::Backend* backend, const core::Endpoint& dst,
+        void SendClosedPortRst(ndi::Backend* backend, std::recursive_mutex& tx_lock,
+                               const core::Endpoint& dst,
                                const core::Endpoint& src, UInt32 syn_seq) noexcept {
             if (NULLPTR == backend || (4 != dst.family && 6 != dst.family)) {
                 return;
@@ -282,7 +283,15 @@ namespace xtcp {
             out.data = pkt;
             out.len = v6 ? 60u : 40u;
             out.eth_type = v6 ? kIpv6 : kIpv4;
-            backend->Tx(std::move(out));  // best-effort: a rejected RST is harmless (the SYN retransmits)
+            // Same backend serialization as every other emit site: this RST
+            // is built without a connection, but it still shares the
+            // backend's transmit queue with the data path. Sending it
+            // unlocked races Tx() against the shards' emissions (the same
+            // corruption class as the data path).
+            {
+                std::lock_guard<std::recursive_mutex> tx_scope(tx_lock);
+                backend->Tx(std::move(out));  // best-effort: a rejected RST is harmless (the SYN retransmits)
+            }
         }
 
         // Listener address comparison (IPv4: addr[0]; IPv6: addr[0..3]).
@@ -2390,7 +2399,7 @@ namespace xtcp {
                 }
                 if (closed_rst_count_.load(std::memory_order_relaxed) < kClosedRstLimit) {
                     closed_rst_count_.fetch_add(1, std::memory_order_relaxed);
-                    SendClosedPortRst(backend_, dst, src, tcp.seq);
+                    SendClosedPortRst(backend_, backend_tx_mutex_, dst, src, tcp.seq);
                 }
                 return;
             }
