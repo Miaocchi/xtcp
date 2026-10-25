@@ -553,7 +553,11 @@ namespace xtcp {
                 UInt32 batch_count = 0;
                 auto FlushBatch = [&]() noexcept {
                     if (0 < batch_count) {
-                        const UInt32 accepted = backend_->TxBatch(batch, batch_count);
+                        UInt32 accepted = 0;
+                        {
+                            std::lock_guard<std::recursive_mutex> scope(backend_tx_mutex_);
+                            accepted = backend_->TxBatch(batch, batch_count);
+                        }
                     // GSO segments belong to THIS connection: defer them on
                     // its own shard's retry queue (never shard 0) so the
                     // retry drain keeps every connection's wire order.
@@ -728,7 +732,12 @@ namespace xtcp {
         // foreign shard's drain without that lock, so the push must be
         // lock-free (a deque push would race the sweep's locked pop).
         void XtcpStack::EmitOrRetry(Shard& shard, ndi::Packet&& out) noexcept {
-            if (backend_->Tx(std::move(out))) {
+            bool accepted = false;
+            {
+                std::lock_guard<std::recursive_mutex> scope(backend_tx_mutex_);
+                accepted = backend_->Tx(std::move(out));
+            }
+            if (accepted) {
                 return;
             }
             buf::BufRef ref;
@@ -824,7 +833,11 @@ namespace xtcp {
             buf::BufRef packet = tx_qdisc_->ops->dequeue(tx_qdisc_, now, &next);
             if (packet.IsEmpty()) {
                 if (0 < batch_count) {
-                    const UInt32 accepted = backend_->TxBatch(batch, batch_count);
+                    UInt32 accepted = 0;
+                    {
+                        std::lock_guard<std::recursive_mutex> scope(backend_tx_mutex_);
+                        accepted = backend_->TxBatch(batch, batch_count);
+                    }
                     RetryBatchSharded(batch, accepted, batch_count);
                     batch_count = 0;
                 }
@@ -846,8 +859,12 @@ namespace xtcp {
             out.owned = std::move(packet);
             ++batch_count;
             if (kTxBatchMax == batch_count) {
-                const UInt32 accepted = backend_->TxBatch(batch, batch_count);
-                    RetryBatchSharded(batch, accepted, batch_count);
+                UInt32 accepted = 0;
+                {
+                    std::lock_guard<std::recursive_mutex> scope(backend_tx_mutex_);
+                    accepted = backend_->TxBatch(batch, batch_count);
+                }
+                RetryBatchSharded(batch, accepted, batch_count);
                 batch_count = 0;
             }
         }
@@ -1554,7 +1571,12 @@ namespace xtcp {
                     out.len = fifo->ref.Len();
                     out.eth_type = fifo->eth_type;
                     out.owned = fifo->ref.Clone();
-                    if (!backend_->Tx(std::move(out))) {
+                    bool tx_ok = false;
+                    {
+                        std::lock_guard<std::recursive_mutex> tx_scope(backend_tx_mutex_);
+                        tx_ok = backend_->Tx(std::move(out));
+                    }
+                    if (!tx_ok) {
                         fifo_tail->next = shard.tx_retry_head_.load(std::memory_order_relaxed);
                         while (!shard.tx_retry_head_.compare_exchange_weak(
                                    fifo_tail->next, fifo, std::memory_order_release,
@@ -1678,7 +1700,12 @@ namespace xtcp {
                     out.len = fifo->ref.Len();
                     out.eth_type = fifo->eth_type;
                     out.owned = fifo->ref.Clone();  // shared refcount; the node keeps one until accepted
-                    if (!backend_->Tx(std::move(out))) {
+                    bool tx_ok = false;
+                    {
+                        std::lock_guard<std::recursive_mutex> tx_scope(backend_tx_mutex_);
+                        tx_ok = backend_->Tx(std::move(out));
+                    }
+                    if (!tx_ok) {
                         // ring still full: re-link the remaining suffix
                         // [fifo .. fifo_tail] back onto the head (FIFO
                         // preserved: the suffix keeps its order, and the

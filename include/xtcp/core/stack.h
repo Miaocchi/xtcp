@@ -939,6 +939,28 @@ typedef std::function<bool(UInt64 conn_id, const Byte* data, UInt32 len)> RecvHa
                           bool as_accept) noexcept;
         Shard* ShardOf(const core::FlowKey& key) noexcept;
 
+        /**
+         * @brief Serializes every call into ndi::Backend::Tx / TxBatch.
+         *
+         * Backend::Tx() carries no thread-safety requirement: the shipped
+         * TUN backend appends to a plain std::deque and a DMA-ring backend
+         * writes a descriptor ring, neither of which tolerates two writers.
+         * The connection table is sharded and each shard emits under its OWN
+         * lock, so two connections on different shards reach the backend
+         * concurrently and corrupt its queue (observed in the real TUN path
+         * as "free(): corrupted unsorted chunks"). Emission is therefore
+         * serialized here, once, for every backend - the lock is per-stack,
+         * so independent stacks (one per worker, the tun2socks layout) never
+         * contend on it.
+         *
+         * RECURSIVE on purpose: a backend may deliver the accepted frame to
+         * its peer SYNCHRONOUSLY inside Tx() (the in-process test backends
+         * do exactly that), and the peer's ACK then re-enters this stack's
+         * emit path on the SAME thread. A plain mutex self-deadlocks there;
+         * recursion keeps the "one writer at a time" guarantee because the
+         * re-entry is the same thread, not a second one.
+         */
+        std::recursive_mutex     backend_tx_mutex_;
         ndi::Backend*            backend_ = NULLPTR;
         ndi::BackendCaps         caps_ = ndi::kCapNone;  /**< Cached backend caps (Caps() is constant for the backend's lifetime; snapshot at construction so Emit avoids a per-packet virtual call) */
         std::vector<core::Endpoint> listeners_;

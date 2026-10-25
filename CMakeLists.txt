@@ -109,6 +109,7 @@ if(XTCP_BUILD_TESTS)
     set(XTCP_TESTS
         test_smoke
         test_ndi
+        test_ndi_tx_concurrency
         test_mempool
         test_bufref
         test_bufref_starvation
